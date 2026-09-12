@@ -33,7 +33,7 @@ from monosplit.speakers import (
     speech_energy_runs,
     split_runs,
 )
-from monosplit.transcribe import Transcriber, text_in_range
+from monosplit.transcribe import Transcriber, words_per_piece
 
 # Khung VAD và ngưỡng lượt — cùng bộ số với đường hai kênh để hai đường cho ra
 # cùng một dòng thời gian trên cùng một bản ghi.
@@ -147,7 +147,7 @@ def separate(
             raise SeparationError("khong_tach_nguoi_noi", ERRORS["khong_tach_nguoi_noi"])
 
         words = transcriber.words(mono_path) if transcriber is not None else []
-        texts = [text_in_range(words, start, end, TURN_MERGE_GAP_MS) for start, end, _c in pieces]
+        texts = words_per_piece(words, pieces, TURN_MERGE_GAP_MS)
 
         labels, reason = _label(splitter, samples, pieces, texts, requirements)
         warnings: list[str] = []

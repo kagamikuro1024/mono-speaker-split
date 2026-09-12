@@ -63,8 +63,34 @@ class Transcriber:
         return out
 
 
-def text_in_range(words: list[Word], start_ms: int, end_ms: int, pad_ms: int = 400) -> str:
-    """Chữ rơi vào một quãng. Nới hai đầu vì mốc ASR lệch vài trăm mili giây."""
-    return " ".join(
-        word.text for word in words if word.end_ms > start_ms - pad_ms and word.start_ms < end_ms + pad_ms
-    ).strip()
+def words_per_piece(
+    words: list[Word], pieces: list[tuple[int, int, int]], pad_ms: int = 400
+) -> list[str]:
+    """Chia chữ cho từng mảnh — mỗi từ thuộc ĐÚNG MỘT mảnh.
+
+    Cách cũ (`text_in_range`) để mỗi mảnh tự nới hai đầu ``pad_ms`` rồi quét
+    độc lập, nên một từ ở vùng giáp ranh đi vào CẢ HAI mảnh. Hậu quả không chỉ
+    là chữ lặp: lượt của một bên mang theo câu bên kia vừa nói, và ai đọc bản
+    ghi sau đó tin rằng người này đã nói câu của người kia.
+
+    Luật: từ thuộc mảnh mà nó GIAO nhiều nhất. Từ không giao mảnh nào (mốc ASR
+    lệch, hoặc rơi vào khoảng lặng) mới về mảnh gần nhất, và chỉ khi còn trong
+    ``pad_ms`` — xa hơn thì nó không phải lời của lượt nào cả.
+    """
+    buckets: list[list[str]] = [[] for _ in pieces]
+    for word in words:
+        best, best_overlap = -1, 0
+        for index, (start, end, _cluster) in enumerate(pieces):
+            overlap = min(end, word.end_ms) - max(start, word.start_ms)
+            if overlap > best_overlap:
+                best, best_overlap = index, overlap
+        if best < 0:
+            gap, index = min(
+                (max(start - word.end_ms, word.start_ms - end, 0), index)
+                for index, (start, end, _c) in enumerate(pieces)
+            )
+            if gap > pad_ms:
+                continue
+            best = index
+        buckets[best].append(word.text)
+    return [" ".join(bucket).strip() for bucket in buckets]

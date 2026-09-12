@@ -190,6 +190,31 @@ người, Fisher/CALLHOME, overlap thật 13–14% —
 pretrained dùng ngay của Alibaba là **audio-visual** (cần video khuôn mặt), checkpoint
 MossFormer2 nặng **670 MB** so với 44 MB hiện tại. Đổi như thế để có con số sai 20–40%: không.
 
+### Chữ ở đoạn chồng: mỗi từ thuộc đúng một lượt
+
+Ở đoạn hai người cùng nói, ASR chỉ nghe ra **một** chuỗi từ — nó không biết mình đang nghe hai
+người. Chuỗi đó phải chia cho hai lượt, và cách chia quyết định bản ghi có đọc được hay không.
+
+Cách cũ để mỗi lượt tự nới hai đầu 400 ms rồi quét độc lập, nên từ ở vùng giáp ranh đi vào **cả
+hai** lượt. Không chỉ là chữ lặp: lượt của khách mang theo câu agent vừa đọc lại, và ai đọc bản
+ghi sau đó — người hay mô hình chấm — tin rằng agent đã nhắc lại con số ấy. Bằng chứng cho một
+việc chưa xảy ra.
+
+`words_per_piece()` gán mỗi từ cho lượt nó **giao nhiều nhất**. Từ không giao lượt nào (mốc ASR
+lệch, hoặc rơi vào khoảng lặng) mới về lượt gần nhất, và chỉ khi còn trong 400 ms — xa hơn thì bỏ,
+vì gán bừa tệ hơn thiếu một từ.
+
+Điều này **không** dựng lại được phần chữ đã mất. Cụm từ nằm trong đoạn chồng bị cắt làm hai, nửa
+đầu về người này nửa sau về người kia:
+
+```
+caller      0-5262   … nhớ nhắc lại số trước khi bấm gọi nhé. Số 09
+agent    5262-8160   -03456789, tôi gọi Lua Nga.
+```
+
+Muốn chữ đủ cho cả hai bên thì phải có hai luồng tiếng, tức phải có bản ghi hai kênh. Chỗ này là
+vật lý, không phải chỗ mã dở.
+
 ## Ngưỡng quan trọng
 
 Con số nào cũng đo được, và chỗ nào đo trên bộ mẫu thì ghi luôn khoảng đo trong mã nguồn.
