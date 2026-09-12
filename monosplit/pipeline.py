@@ -95,7 +95,7 @@ class Result:
     #: `None` khi không suy được hướng).
     #:
     #: PHỎNG ĐOÁN, không phải phép đo — xem `speakers.overlap_spans`. Dùng số
-    #: lần và mốc; đừng cộng `duration_ms` thành tổng số giây nói chồng.
+    #: lần và mốc; đừng cộng `duration_ms` thành tổng số giây overlap.
     overlaps: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:

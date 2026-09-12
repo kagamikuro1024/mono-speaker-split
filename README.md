@@ -112,8 +112,8 @@ Kéo tệp vào trang để xem dạng sóng và các lượt đã gán vai. API
 
 ## Điều dự án này KHÔNG làm
 
-- **Không đo được tổng số giây nói chồng.** Hai người cùng nói trên một kênh thì chỉ còn một
-  luồng sóng âm — không tách lại được. *Phát hiện* có nói chồng thì làm được (xem mục dưới), còn
+- **Không đo được tổng số giây overlap.** Hai người cùng nói trên một kênh thì chỉ còn một
+  luồng sóng âm — không tách lại được. *Phát hiện* có overlap thì làm được (xem mục dưới), còn
   cộng thành tổng thời lượng thì không: chỗ này phải báo "chưa đo được", không được báo 0.
 - **Nhãn là suy đoán, không phải sự thật.** Mọi `Result` mang theo `role_reason` (lớp 2 đã chọn
   bằng căn cứ nào) và `margin` từng lượt. Căn cứ yếu nhất — "đoán theo bên nói lượt cuối" — được
@@ -126,7 +126,7 @@ Kéo tệp vào trang để xem dạng sóng và các lượt đã gán vai. API
   nói. Giọng agent đổi theo cấu hình của từng người dùng nên không ghim được.
 - **Không phải bộ gỡ băng.** Chép lời là nhánh tuỳ chọn, có mặt để lớp 2 có chữ mà chọn vai.
 
-## Phát hiện nói chồng: đo được, nhưng chỉ là phỏng đoán
+## Phát hiện overlap: đo được, nhưng chỉ là phỏng đoán
 
 Mô hình phân đoạn mà lớp 1 đang dùng là **powerset 7 lớp** — đọc thẳng từ metadata của
 `seg.onnx`:
@@ -150,7 +150,7 @@ sự thật lấy từ hai kênh riêng:
 
 | Ca | Sự thật (2 kênh) | Mô hình (bản trộn mono) |
 |---|---|---|
-| 5 ca không có nói chồng | 0 s | **0 s — không lần nào báo bừa** |
+| 5 ca không có overlap | 0 s | **0 s — không lần nào báo bừa** |
 | 1 ca chồng 0,7 s | 0,59 s tại 4,49–5,16 s | 0,78 s tại 4,42–5,20 s |
 
 Ca có chồng: **recall 1,00** theo frame, precision 0,76, F1 0,86. Mốc bắt đầu lệch **60 ms** so
@@ -177,7 +177,7 @@ Chỗ yếu là recall: backchannel ngắn ("dạ", "ừ" dưới 200 ms) — đ
 bị bỏ sót nhiều. Thêm nữa biên nhoè **±62 ms** (receptive field 991 mẫu) nên tổng thời lượng
 phình cỡ **1,36 lần**.
 
-Nên ranh giới là: **có/không có nói chồng** và **mốc bắt đầu** thì đo được; **tổng số giây** thì
+Nên ranh giới là: **có/không có overlap** và **mốc bắt đầu** thì đo được; **tổng số giây** thì
 không. Báo số lần và mốc, đừng cộng thành giây.
 
 ### Đường "tách sóng ra rồi đo": đã cân, và loại
@@ -231,7 +231,7 @@ Con số nào cũng đo được, và chỗ nào đo trên bộ mẫu thì ghi l
 | `MIN_COSINE_MARGIN` | `0.10` | `speakers.py` | Dưới mức này là hai giọng quá sát (hoặc quãng quá ngắn): giữ nhãn lớp 1, hạ độ tin cậy |
 | `MAX_SAME_VOICE_COSINE` | `0.40` | `speakers.py` | Đo trên bộ nghiệm thu 30 ca: cùng người 0,54–0,74, khác người 0,06–0,27. Lấy 0,40 vào giữa hai khoảng |
 | `MIN_RESCUE_MS` | `180` | `speakers.py` | Lượt hay bị nuốt đúng là "ừ", "dạ" — ngắn hơn mức lấy mẫu bình thường, bỏ nó thì không còn gì để cứu |
-| `MIN_OVERLAP_MS` | `150` | `speakers.py` | Biên của mô hình nhoè ±62 ms, nên quãng chồng ngắn hơn mức này là vụn của chính sai số đó chứ không phải một lần nói chồng |
+| `MIN_OVERLAP_MS` | `150` | `speakers.py` | Biên của mô hình nhoè ±62 ms, nên quãng overlap ngắn hơn mức này là vụn của chính sai số đó chứ không phải một lần overlap |
 
 ## Benchmark
 

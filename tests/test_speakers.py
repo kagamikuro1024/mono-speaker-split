@@ -78,7 +78,7 @@ def test_cung_mot_gia_tri_duoc_ca_hai_ben_noc_la_hai_vai():
 
 
 def test_hai_cum_cung_noi_thi_doc_ra_duoc_ca_moc_va_huong_chen():
-    """``split_runs`` cắt cụm thành mảnh kề nhau nên xoá dấu vết nói chồng.
+    """``split_runs`` cắt cụm thành mảnh kề nhau nên xoá dấu vết overlap.
 
     Đọc trực tiếp từ các cụm thì còn: cụm 1 vào lúc 4,42 s trong khi cụm 0 đang
     nói tới 5 s, và cụm 0 là bên rời khoảng chồng trước.

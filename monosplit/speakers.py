@@ -20,7 +20,7 @@ Ba lớp, đúng thứ tự, mỗi lớp sửa cái lớp trước không làm �
    1 đã nuốt.
 
 Cái KHÔNG làm được và không được giả vờ làm được: hai người cùng nói trên một
-kênh thì chỉ còn một luồng sóng âm, nên nói chồng / cướp lời phải báo "chưa đo
+kênh thì chỉ còn một luồng sóng âm, nên overlap / cướp lời phải báo "chưa đo
 được" chứ không báo 0.
 """
 
@@ -269,7 +269,7 @@ def split_runs(
     return pieces
 
 
-# Quãng chồng ngắn hơn mức này là vụn của biên chứ không phải một lần nói chồng:
+# Quãng chồng ngắn hơn mức này là vụn của biên chứ không phải một lần overlap:
 # mô hình phân đoạn có receptive field 991 mẫu (62 ms) nên mọi ranh giới đều
 # nhoè cỡ đó. Đo trên bộ mẫu: chồng thật 0,59 s bị báo 0,78 s.
 MIN_OVERLAP_MS = 150
@@ -288,7 +288,7 @@ def overlap_spans(clusters: list[tuple[int, int, int]]) -> list[dict[str, int]]:
     ``cum_chen`` là cụm vào sau, ``cum_nhuong`` là cụm rời khoảng chồng trước;
     ``-1`` khi hai mốc bằng nhau, vì khi đó không ai chen ai.
 
-    Đây là PHỎNG ĐOÁN, không phải phép đo: quãng chồng dưới 200 ms bị bỏ sót
+    Đây là PHỎNG ĐOÁN, không phải phép đo: quãng overlap dưới 200 ms bị bỏ sót
     nhiều (F1 của OSD trên thoại điện thoại quanh 0,60 — DIHARD III) và biên
     nhoè nên tổng thời lượng phình cỡ 1,4 lần. Đếm số lần và lấy mốc thì được;
     cộng thành tổng số giây thì không.
