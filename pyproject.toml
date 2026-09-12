@@ -1,0 +1,48 @@
+[project]
+name = "monosplit"
+version = "0.1.0"
+description = "Tách khách / agent khỏi bản ghi cuộc gọi một kênh — ba lớp, chạy CPU, không PyTorch"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.26",
+    # sherpa-onnx: pyannote segmentation 3.0 + vân giọng ERes2Net, cả hai chạy
+    # trên onnxruntime. Wheel vài MB, KHÔNG kéo theo PyTorch.
+    "sherpa-onnx>=1.13",
+    # Thư viện native mà `sherpa-onnx` nạp lúc import. Máy dev hay có sẵn nên
+    # dễ quên; thiếu nó thì `import sherpa_onnx` chết bằng
+    # "libonnxruntime.so: cannot open shared object file".
+    "sherpa-onnx-core>=1.13",
+]
+
+[project.optional-dependencies]
+# Chép lời. Không cài thì vẫn tách được vai, chỉ là lượt không có chữ — và lớp
+# 2 (chữ chọn vai) mất căn cứ, phải rơi về suy đoán theo thứ tự lượt.
+asr = ["faster-whisper>=1.1"]
+# Giao diện web.
+web = ["fastapi>=0.115", "uvicorn>=0.30", "python-multipart>=0.0.9"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+monosplit = "monosplit.cli:main"
+
+[project.urls]
+Source = "https://github.com/kagamikuro1024/mono-speaker-split"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["monosplit"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

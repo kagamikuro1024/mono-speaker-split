@@ -1,0 +1,106 @@
+[
+  {
+    "file": "benchmark/audio/doan_00.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 00 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_01.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 01 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_02.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 02 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_03.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 03 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_04.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 04 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_05.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 05 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_06.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 06 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_07.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 07 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_08.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 08 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/doan_09.m4a",
+    "mo_ta": "Cuộc gọi tổng đài thật, đoạn 09 (~105 giây, stereo giả: hai kênh trùng nhau, hai người nói thật)",
+    "ky_vong": {
+      "hai_vai": true,
+      "so_luot_toi_thieu": 4
+    }
+  },
+  {
+    "file": "benchmark/audio/01_readback_dung.wav",
+    "mo_ta": "Bản dựng hai kênh THẬT (agent đọc lại đúng) — ca đối chứng, phải bị từ chối",
+    "ky_vong": {
+      "hai_vai": false,
+      "loi": "hai_kenh_that"
+    }
+  },
+  {
+    "file": "benchmark/audio/04_im_lang_dai.wav",
+    "mo_ta": "Bản dựng hai kênh THẬT (im lặng dài giữa cuộc) — ca đối chứng, phải bị từ chối",
+    "ky_vong": {
+      "hai_vai": false,
+      "loi": "hai_kenh_that"
+    }
+  },
+  {
+    "file": "benchmark/audio/05_noi_chong.wav",
+    "mo_ta": "Bản dựng hai kênh THẬT (hai bên nói chồng lời) — ca đối chứng, phải bị từ chối",
+    "ky_vong": {
+      "hai_vai": false,
+      "loi": "hai_kenh_that"
+    }
+  }
+]

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+.cache/
+
+# Kết quả một lần chạy benchmark, sinh lại được từ bộ âm thanh.
+benchmark/report.json
+
+# Bản ghi cuộc gọi: dữ liệu thật của người thật, không đẩy lên repo.
+*.wav
+*.m4a
+*.mp3
