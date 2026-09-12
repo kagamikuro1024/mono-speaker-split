@@ -6,7 +6,12 @@ có bài kiểm riêng — hỏng ở đây thì mọi bản gỡ băng đều �
 
 from __future__ import annotations
 
-from monosplit.speakers import co_bang_chung_hai_vai, pick_agent_cluster, split_runs
+from monosplit.speakers import (
+    co_bang_chung_hai_vai,
+    overlap_spans,
+    pick_agent_cluster,
+    split_runs,
+)
 
 
 def test_mot_quang_lien_mach_bi_cat_tai_cho_doi_nguoi():
@@ -70,3 +75,24 @@ def test_cung_mot_gia_tri_duoc_ca_hai_ben_noc_la_hai_vai():
         )
         is True
     )
+
+
+def test_hai_cum_cung_noi_thi_doc_ra_duoc_ca_moc_va_huong_chen():
+    """``split_runs`` cắt cụm thành mảnh kề nhau nên xoá dấu vết nói chồng.
+
+    Đọc trực tiếp từ các cụm thì còn: cụm 1 vào lúc 4,42 s trong khi cụm 0 đang
+    nói tới 5 s, và cụm 0 là bên rời khoảng chồng trước.
+    """
+    assert overlap_spans([(0, 5_000, 0), (4_420, 8_000, 1)]) == [
+        {"start_ms": 4_420, "duration_ms": 580, "cum_chen": 1, "cum_nhuong": 0}
+    ]
+
+
+def test_cung_mot_nguoi_noi_hai_quang_thi_khong_phai_noi_chong():
+    assert overlap_spans([(0, 5_000, 0), (4_000, 8_000, 0)]) == []
+
+
+def test_chong_ngan_hon_do_nhoe_cua_bien_thi_khong_dem():
+    """Chồng 80 ms nhỏ hơn độ nhoè biên của mô hình (receptive field 62 ms):
+    đếm nó là đếm chính sai số của mình."""
+    assert overlap_spans([(0, 5_000, 0), (4_920, 8_000, 1)]) == []

@@ -91,6 +91,9 @@ seg, emb = ensure_models()
 result = separate(Path("cuoc-goi.wav"), MonoSpeakerSplitter(str(seg), str(emb)))
 for turn in result.turns:
     print(f"{turn.start_ms:>7} {turn.speaker:<6} {turn.text}")
+
+for span in result.overlaps:          # nghi hai bên cùng nói — phỏng đoán
+    print(f"{span['start_ms']:>7} {span['who_cut_in']} chen vào")
 ```
 
 `separate` nhận thêm `transcriber=Transcriber("small")` để có chữ, và `requirements=[...]` như
@@ -109,8 +112,9 @@ Kéo tệp vào trang để xem dạng sóng và các lượt đã gán vai. API
 
 ## Điều dự án này KHÔNG làm
 
-- **Không đo nói chồng / cướp lời.** Hai người cùng nói trên một kênh thì chỉ còn một luồng sóng
-  âm — không có cách nào tách ra. Chỗ này phải báo "chưa đo được", không được báo 0.
+- **Không đo được tổng số giây nói chồng.** Hai người cùng nói trên một kênh thì chỉ còn một
+  luồng sóng âm — không tách lại được. *Phát hiện* có nói chồng thì làm được (xem mục dưới), còn
+  cộng thành tổng thời lượng thì không: chỗ này phải báo "chưa đo được", không được báo 0.
 - **Nhãn là suy đoán, không phải sự thật.** Mọi `Result` mang theo `role_reason` (lớp 2 đã chọn
   bằng căn cứ nào) và `margin` từng lượt. Căn cứ yếu nhất — "đoán theo bên nói lượt cuối" — được
   nói thẳng ra để bạn soát lại, chứ không ẩn đi cho kết quả trông chắc chắn.
@@ -121,6 +125,70 @@ Kéo tệp vào trang để xem dạng sóng và các lượt đã gán vai. API
 - **Không nhận diện người nói cụ thể.** Không có cơ sở dữ liệu giọng, không biết agent nào đang
   nói. Giọng agent đổi theo cấu hình của từng người dùng nên không ghim được.
 - **Không phải bộ gỡ băng.** Chép lời là nhánh tuỳ chọn, có mặt để lớp 2 có chữ mà chọn vai.
+
+## Phát hiện nói chồng: đo được, nhưng chỉ là phỏng đoán
+
+Mô hình phân đoạn mà lớp 1 đang dùng là **powerset 7 lớp** — đọc thẳng từ metadata của
+`seg.onnx`:
+
+```
+num_classes = 7 · num_speakers = 3 · powerset_max_classes = 2
+receptive_field_shift = 270   → 16,875 ms mỗi frame
+```
+
+7 lớp là `{∅, s1, s2, s3, s1s2, s1s3, s2s3}` — **ba lớp cuối là hai người nói cùng lúc**
+([Plaquet & Bredin, arXiv:2310.13025](https://arxiv.org/abs/2310.13025)). Điểm hay: overlap là
+một lớp `argmax` bình thường, không có ngưỡng nào phải tinh chỉnh. `sherpa_onnx.OfflineSpeakerDiarization.process()`
+cũng đã trả về các segment **chồng nhau về thời gian**, nên thông tin có sẵn; chính
+`speakers.py::split_runs()` cắt chúng thành mảnh kề nhau — cần thế để mỗi lượt có đúng một nhãn —
+và đó là chỗ dấu vết "hai người cùng nói" bị xoá.
+
+### Đo trên bộ có sự thật đi kèm
+
+Trộn bản ghi hai kênh thành một kênh rồi bắt mô hình làm việc **chỉ với bản trộn**, so lại với
+sự thật lấy từ hai kênh riêng:
+
+| Ca | Sự thật (2 kênh) | Mô hình (bản trộn mono) |
+|---|---|---|
+| 5 ca không có nói chồng | 0 s | **0 s — không lần nào báo bừa** |
+| 1 ca chồng 0,7 s | 0,59 s tại 4,49–5,16 s | 0,78 s tại 4,42–5,20 s |
+
+Ca có chồng: **recall 1,00** theo frame, precision 0,76, F1 0,86. Mốc bắt đầu lệch **60 ms** so
+với sự thật khai trong manifest, dưới sai số 150 ms của chính bộ mẫu. Hướng chen cũng suy được từ
+chuỗi nhãn: cụm vào sau là người chen, cụm rời khoảng chồng trước là người nhường.
+
+Chi phí: **0,9 giây xử lý mỗi phút audio** trên CPU, không thêm mô hình nào.
+
+### Vì sao vẫn không được trình bày như phép đo
+
+Độ nhạy trên **giọng người thật qua điện thoại** (trộn hai giọng thật từ hai bản ghi tổng đài):
+
+| Chồng thật | Bắt được | Frame recall |
+|---|---|---|
+| 200 ms × 3 | 2/3 | 0,45 |
+| 400 ms × 3 | 2/3 | 0,67 |
+| 800 ms × 3 | 2/3 | 0,54 |
+| 1500 ms × 3 | **3/3** | 0,69 |
+
+Khớp số liệu công bố: F1 của overlapped speech detection tụt từ ~75 trên micro cài đầu (AMI)
+xuống **~60 trên DIHARD III** có miền thoại điện thoại
+([Bredin & Laurent, Interspeech 2021, Table 2](https://www.isca-archive.org/interspeech_2021/bredin21_interspeech.pdf)).
+Chỗ yếu là recall: backchannel ngắn ("dạ", "ừ" dưới 200 ms) — đúng loại hay gặp nhất ở tổng đài —
+bị bỏ sót nhiều. Thêm nữa biên nhoè **±62 ms** (receptive field 991 mẫu) nên tổng thời lượng
+phình cỡ **1,36 lần**.
+
+Nên ranh giới là: **có/không có nói chồng** và **mốc bắt đầu** thì đo được; **tổng số giây** thì
+không. Báo số lần và mốc, đừng cộng thành giây.
+
+### Đường "tách sóng ra rồi đo": đã cân, và loại
+
+Đo overlap từ hai luồng *tách ra* sinh overlap giả. Đo trên đúng miền này — thoại điện thoại hai
+người, Fisher/CALLHOME, overlap thật 13–14% —
+[Morrone et al. 2024](https://arxiv.org/html/2303.12002v2) cho: separator tốt (SI-SDRi ~22 dB)
+**FA 2,6–4%**, separator rẻ (Conv-TasNet) **FA 31%** — lớn hơn cả lượng cần đo; ngay cả tách
+**hoàn hảo** (oracle) vẫn FA 1,8%. Cộng thêm: không mô hình TSE nào có bản ONNX chính thức, bản
+pretrained dùng ngay của Alibaba là **audio-visual** (cần video khuôn mặt), checkpoint
+MossFormer2 nặng **670 MB** so với 44 MB hiện tại. Đổi như thế để có con số sai 20–40%: không.
 
 ## Ngưỡng quan trọng
 
@@ -138,6 +206,7 @@ Con số nào cũng đo được, và chỗ nào đo trên bộ mẫu thì ghi l
 | `MIN_COSINE_MARGIN` | `0.10` | `speakers.py` | Dưới mức này là hai giọng quá sát (hoặc quãng quá ngắn): giữ nhãn lớp 1, hạ độ tin cậy |
 | `MAX_SAME_VOICE_COSINE` | `0.40` | `speakers.py` | Đo trên bộ nghiệm thu 30 ca: cùng người 0,54–0,74, khác người 0,06–0,27. Lấy 0,40 vào giữa hai khoảng |
 | `MIN_RESCUE_MS` | `180` | `speakers.py` | Lượt hay bị nuốt đúng là "ừ", "dạ" — ngắn hơn mức lấy mẫu bình thường, bỏ nó thì không còn gì để cứu |
+| `MIN_OVERLAP_MS` | `150` | `speakers.py` | Biên của mô hình nhoè ±62 ms, nên quãng chồng ngắn hơn mức này là vụn của chính sai số đó chứ không phải một lần nói chồng |
 
 ## Benchmark
 

@@ -28,6 +28,7 @@ from monosplit.speakers import (
     MonoSpeakerSplitter,
     MonoSplitUnavailable,
     co_bang_chung_hai_vai,
+    overlap_spans,
     pick_agent_cluster,
     speech_energy_runs,
     split_runs,
@@ -89,6 +90,13 @@ class Result:
     same_voice: bool = False
     #: Cảnh báo cho người đọc kết quả.
     warnings: list[str] = field(default_factory=list)
+    #: Các lần NGHI hai bên cùng nói, đọc từ lớp powerset của mô hình phân đoạn.
+    #: Mỗi mục: `start_ms`, `duration_ms`, `who_cut_in`, `who_yielded` (tên vai,
+    #: `None` khi không suy được hướng).
+    #:
+    #: PHỎNG ĐOÁN, không phải phép đo — xem `speakers.overlap_spans`. Dùng số
+    #: lần và mốc; đừng cộng `duration_ms` thành tổng số giây nói chồng.
+    overlaps: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -134,7 +142,7 @@ def separate(
         if not runs:
             raise SeparationError("khong_co_tieng_noi", ERRORS["khong_co_tieng_noi"])
 
-        pieces, same_voice = _pieces(splitter, samples, runs)
+        pieces, same_voice, spans = _pieces(splitter, samples, runs)
         if len(pieces) < 2:
             raise SeparationError("khong_tach_nguoi_noi", ERRORS["khong_tach_nguoi_noi"])
 
@@ -157,6 +165,27 @@ def separate(
             Turn(label.speaker, label.start_ms, label.end_ms, text, label.margin)
             for label, text in zip(labels, texts, strict=True)
         ]
+
+        # Cụm là số, người đọc cần tên vai: lấy mapping từ chính nhãn lớp 2 —
+        # cụm nào đóng góp nhiều thời lượng nhất cho một vai thì thuộc vai đó.
+        by_cluster: dict[tuple[int, str], int] = {}
+        for (start, end, cluster), label in zip(pieces, labels, strict=True):
+            key = (cluster, label.speaker)
+            by_cluster[key] = by_cluster.get(key, 0) + (end - start)
+        role_of: dict[int, str] = {}
+        for cluster in {piece[2] for piece in pieces}:
+            sides = [(ms, role) for (c, role), ms in by_cluster.items() if c == cluster]
+            if sides:
+                role_of[cluster] = max(sides)[1]
+        overlaps = [
+            {
+                "start_ms": span["start_ms"],
+                "duration_ms": span["duration_ms"],
+                "who_cut_in": role_of.get(span["cum_chen"]),
+                "who_yielded": role_of.get(span["cum_nhuong"]),
+            }
+            for span in spans
+        ]
         if transcriber is not None:
             turns = [turn for turn in turns if turn.text] or turns
 
@@ -169,20 +198,35 @@ def separate(
             role_reason=reason,
             same_voice=same_voice,
             warnings=warnings,
+            overlaps=overlaps,
         )
 
 
-def _pieces(splitter: MonoSpeakerSplitter, samples, runs) -> tuple[list[tuple[int, int, int]], bool]:
-    """Lớp 1: phân cụm mù, cắt quãng tại chỗ đổi người, cứu nếu gom hụt."""
-    pieces = split_runs(runs, splitter.clusters(samples))
+def _pieces(
+    splitter: MonoSpeakerSplitter, samples, runs
+) -> tuple[list[tuple[int, int, int]], bool, list[dict[str, int]]]:
+    """Lớp 1: phân cụm mù, cắt quãng tại chỗ đổi người, cứu nếu gom hụt.
+
+    Phần tử thứ ba là các khoảng hai cụm cùng hoạt động, đọc TRƯỚC khi
+    ``split_runs`` cắt chúng thành mảnh kề nhau.
+    """
+    clusters = splitter.clusters(samples)
+    spans = overlap_spans(clusters)
+    pieces = split_runs(runs, clusters)
     if len({piece[2] for piece in pieces}) >= 2:
-        return pieces, False
+        return pieces, False, spans
     # Phân cụm mù nuốt mất một bên — hay gặp khi một bên chỉ "ừ", "dạ". Thử lại
     # bằng vân giọng trước khi kết luận chỉ có một giọng.
     rescued = splitter.split_by_voice(samples, pieces)
     if rescued is not None and len({piece[2] for piece in rescued}) >= 2:
-        return rescued, False
-    return [(start, end, index % 2) for index, (start, end, _c) in enumerate(pieces)], True
+        return rescued, False, spans
+    # Gán luân phiên thì số cụm hết nghĩa: giữ mốc, bỏ hướng chen — suy "ai chen
+    # ai" từ một mapping đã hỏng là bịa.
+    return (
+        [(start, end, index % 2) for index, (start, end, _c) in enumerate(pieces)],
+        True,
+        [{**span, "cum_chen": -1, "cum_nhuong": -1} for span in spans],
+    )
 
 
 def _label(

@@ -54,6 +54,14 @@ def _in_ket_qua(result: Result) -> None:
     print(f"Nguồn      : {result.source}  ({result.duration_ms / 1000:.1f}s, {result.channels} kênh)")
     print(f"Đường chạy : {result.mode}")
     print(f"Chọn vai   : {result.role_reason or '—'}")
+    if result.overlaps:
+        # Số lần và mốc, KHÔNG tổng số giây: biên của mô hình nhoè ±62 ms nên
+        # cộng lại là bịa ra một con số chính xác hơn thứ đo được.
+        print(f"Nghi nói chồng: {len(result.overlaps)} lần (phỏng đoán, không phải phép đo)")
+        for span in result.overlaps:
+            ai = span["who_cut_in"]
+            huong = f" — {VAI[ai]} chen vào" if ai in VAI else ""
+            print(f"             {span['start_ms'] / 1000:.1f}s{huong}")
     if result.same_voice:
         print("Lưu ý      : hai bên nghe như một giọng")
     for canh_bao in result.warnings:

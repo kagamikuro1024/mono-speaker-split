@@ -269,6 +269,51 @@ def split_runs(
     return pieces
 
 
+# Quãng chồng ngắn hơn mức này là vụn của biên chứ không phải một lần nói chồng:
+# mô hình phân đoạn có receptive field 991 mẫu (62 ms) nên mọi ranh giới đều
+# nhoè cỡ đó. Đo trên bộ mẫu: chồng thật 0,59 s bị báo 0,78 s.
+MIN_OVERLAP_MS = 150
+
+
+def overlap_spans(clusters: list[tuple[int, int, int]]) -> list[dict[str, int]]:
+    """Khoảng HAI CỤM cùng hoạt động — thứ ``split_runs`` xoá đi.
+
+    Mô hình phân đoạn là powerset 7 lớp (``num_classes=7``,
+    ``powerset_max_classes=2``): ba lớp cuối là hai người nói cùng lúc, nên
+    ``OfflineSpeakerDiarization`` trả về các segment CHỒNG NHAU về thời gian.
+    ``split_runs`` cắt chúng thành mảnh kề nhau — cần thế để mỗi lượt có đúng
+    một nhãn — và đó là nơi dấu vết "hai người cùng nói" mất. Hàm này đọc trước
+    khi mất.
+
+    ``cum_chen`` là cụm vào sau, ``cum_nhuong`` là cụm rời khoảng chồng trước;
+    ``-1`` khi hai mốc bằng nhau, vì khi đó không ai chen ai.
+
+    Đây là PHỎNG ĐOÁN, không phải phép đo: quãng chồng dưới 200 ms bị bỏ sót
+    nhiều (F1 của OSD trên thoại điện thoại quanh 0,60 — DIHARD III) và biên
+    nhoè nên tổng thời lượng phình cỡ 1,4 lần. Đếm số lần và lấy mốc thì được;
+    cộng thành tổng số giây thì không.
+    """
+    out: list[dict[str, int]] = []
+    for index, (a_start, a_end, a_cluster) in enumerate(clusters):
+        for b_start, b_end, b_cluster in clusters[index + 1 :]:
+            if a_cluster == b_cluster:
+                continue
+            start, end = max(a_start, b_start), min(a_end, b_end)
+            if end - start < MIN_OVERLAP_MS:
+                continue
+            late = b_cluster if b_start > a_start else (a_cluster if a_start > b_start else -1)
+            early = a_cluster if a_end < b_end else (b_cluster if b_end < a_end else -1)
+            out.append(
+                {
+                    "start_ms": start,
+                    "duration_ms": end - start,
+                    "cum_chen": late,
+                    "cum_nhuong": early,
+                }
+            )
+    return sorted(out, key=lambda span: span["start_ms"])
+
+
 def co_bang_chung_hai_vai(spoken: list[tuple[int, str]], requirements: list[str]) -> bool:
     """Có thật hai vai trong lời nói không — hỏi khi GIỌNG không trả lời được.
 

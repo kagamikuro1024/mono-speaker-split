@@ -191,6 +191,13 @@ function ve(d) {
   if (d.same_voice && !canh.some((c) => c.includes("một giọng"))) {
     canh.push("Hai bên nghe như một giọng — nhãn gán luân phiên theo lượt, hãy kiểm lại bằng tai.");
   }
+  // Nghi có nói chồng: nói SỐ LẦN và MỐC, không cộng thành tổng số giây — biên
+  // của mô hình nhoè ±62 ms nên một con số tổng trông chính xác hơn sự thật.
+  const VAI_VN = { caller: "Khách", agent: "Agent" };
+  for (const o of d.overlaps || []) {
+    const huong = VAI_VN[o.who_cut_in] ? ` — ${VAI_VN[o.who_cut_in]} chen vào` : "";
+    canh.push(`Nghi nói chồng tại ${(o.start_ms / 1000).toFixed(1)}s${huong} (phỏng đoán, không phải phép đo).`);
+  }
   for (const c of canh) {
     const div = document.createElement("div");
     div.className = "canh-bao";
