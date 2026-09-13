@@ -1,7 +1,8 @@
-"""Giao diện web: thả một tệp vào, xem hai làn lượt nói.
+"""Web interface: drop in one file, see two lanes of turns.
 
-Mô hình nạp MỘT LẦN rồi giữ trong biến module. Nạp lại mỗi request tốn vài
-giây CPU cho đúng một việc đã làm xong từ lần trước.
+The models are loaded ONCE and then kept in module-level variables. Reloading
+them on every request burns a few seconds of CPU on work already finished by
+the previous request.
 """
 
 from __future__ import annotations
@@ -23,11 +24,11 @@ from monosplit.transcribe import Transcriber, TranscriberUnavailable
 
 STATIC = Path(__file__).parent / "static"
 
-# Khung dạng sóng: 20 ms một cột, đủ mịn để nhìn ra nhịp nói mà vẫn nhẹ
-# (một cuộc gọi 5 phút ra 15 000 số).
+# Waveform frame: one column per 20 ms, fine enough to see the rhythm of speech
+# while staying light (a 5-minute call yields 15,000 numbers).
 WAVEFORM_FRAME_MS = 20
 
-app = FastAPI(title="monosplit", description="Tách khách / agent khỏi bản ghi một kênh")
+app = FastAPI(title="monosplit", description="Split caller / agent out of a single-channel recording")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 _splitter: MonoSpeakerSplitter | None = None
@@ -47,7 +48,7 @@ def _get_splitter() -> MonoSpeakerSplitter:
 
 
 def _get_transcriber() -> Transcriber | None:
-    """Không có faster-whisper thì vẫn chạy, chỉ là lượt không có chữ."""
+    """Without faster-whisper it still runs, the turns just carry no text."""
     global _transcriber, _transcriber_loaded
     if not _transcriber_loaded:
         _transcriber_loaded = True
@@ -72,7 +73,7 @@ async def api_separate(
     yeu_cau = [dong.strip() for dong in requirements.splitlines() if dong.strip()]
 
     with tempfile.TemporaryDirectory(prefix="monosplit-web-") as tmp:
-        # Giữ nguyên đuôi tệp: ffmpeg đoán định dạng dễ hơn khi có .m4a/.wav.
+        # Keep the file extension: ffmpeg guesses the format more easily with .m4a/.wav.
         nguon = Path(tmp) / (Path(file.filename or "upload").name or "upload")
         with nguon.open("wb") as out:
             shutil.copyfileobj(file.file, out)

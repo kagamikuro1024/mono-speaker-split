@@ -1,27 +1,31 @@
-"""Gán nhãn khách / agent cho bản ghi MỘT kênh.
+"""Label caller / agent on a SINGLE-channel recording.
 
-Bản ghi hai kênh thì không cần gì cả: kênh nào là ai do người dùng khai. Bản ghi
-một kênh — khách ghi bằng điện thoại trong xe, tổng đài xuất mono — thì phải suy
-ra, và suy sai là chấm oan agent bằng lời của khách.
+A two-channel recording needs none of this: the user declares which channel is
+who. A single-channel recording — a caller recording on a phone inside a car, a
+contact centre exporting mono — has to be inferred, and inferring it wrong
+means blaming the agent for the caller's words.
 
-Ba lớp, đúng thứ tự, mỗi lớp sửa cái lớp trước không làm được:
+Three layers, in this order, each one fixing what the previous cannot do:
 
-1. **Phân cụm mù** (``sherpa-onnx``: pyannote segmentation 3.0 + vân giọng
-   ERes2Net, đều ONNX) chia bản ghi thành hai cụm giọng. Lớp này biết *có hai
-   người* và *đổi người lúc nào*, nhưng không biết ai là ai, và hay nuốt một
-   lượt ngắn vào lượt dài bên cạnh.
-2. **Chọn cụm nào là agent bằng LỜI, không bằng giọng.** Giọng agent đổi theo
-   cấu hình của từng người dùng nên không ghim được; còn vai thì lộ ra trong
-   chữ: agent là bên đọc lại giá trị cần xác nhận và nói những câu của tổng đài.
-   Đây là chỗ duy nhất quyết "ai là ai".
-3. **Chấm lại từng quãng bằng vân giọng** của chính hai cụm đó (lối rút gọn của
-   Target-Speaker VAD, Medennikov 2020): lấy đoạn dài nhất mỗi cụm làm mẫu, rồi
-   so cosine cho từng quãng VAD. Lớp này kéo về đúng bên những lượt ngắn mà lớp
-   1 đã nuốt.
+1. **Blind clustering** (``sherpa-onnx``: pyannote segmentation 3.0 + ERes2Net
+   voice embeddings, both ONNX) splits the recording into two voice clusters.
+   This layer knows *there are two people* and *when the speaker changes*, but
+   not who is who, and it often swallows a short turn into the long turn next
+   to it.
+2. **Pick which cluster is the agent by WORDS, not by voice.** The agent voice
+   changes with each user's configuration, so it cannot be pinned down; the
+   role, though, shows up in the text: the agent is the side that reads values
+   back for confirmation and says the contact centre lines. This is the only
+   place where "who is who" is decided.
+3. **Re-score every span by voice embedding** taken from those same two
+   clusters (a reduced form of Target-Speaker VAD, Medennikov 2020): take the
+   longest piece of each cluster as the enrollment sample, then compare cosine
+   for every VAD span. This layer pulls back to the right side the short turns
+   layer 1 swallowed.
 
-Cái KHÔNG làm được và không được giả vờ làm được: hai người cùng nói trên một
-kênh thì chỉ còn một luồng sóng âm, nên overlap / cướp lời phải báo "chưa đo
-được" chứ không báo 0.
+What this CANNOT do and must not pretend to do: two people speaking at once on
+one channel leave a single waveform, so overlapping speech / barge-in has to be
+reported as "not measurable" rather than as 0.
 """
 
 from __future__ import annotations
@@ -36,43 +40,50 @@ from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
-# Hai lượt cùng cụm cách nhau dưới mức này là một lượt. Phải cùng con số với
-# ``pipeline.TURN_MERGE_GAP_MS`` — hai chỗ tách lượt mà lệch nhau thì cùng một
-# bản ghi ra hai dòng thời gian khác nhau.
+# Two turns of the same cluster less than this apart are one turn. Must be the
+# same number as ``pipeline.TURN_MERGE_GAP_MS`` — two places splitting turns
+# with different numbers turn one recording into two different timelines.
 MERGE_GAP_MS = 400
 
-# Khoảng cách cosine tối thiểu để tin nhãn của lớp 3. Dưới mức này là hai giọng
-# quá giống nhau (hoặc quãng quá ngắn): giữ nhãn của lớp 1 và hạ độ tin cậy.
+# Minimum cosine margin required to trust the label from layer 3. Below it the
+# two voices are too alike (or the span too short): keep the label from layer 1
+# and lower the confidence.
 MIN_COSINE_MARGIN = 0.10
 
-# Đoạn ngắn hơn mức này không đủ để lấy vân giọng: ERes2Net cần ít nhất chừng
-# một giây tiếng nói mới ra vector ổn định.
+# A piece shorter than this is not enough for a voice embedding: ERes2Net needs
+# roughly one second of speech before the vector is stable.
 MIN_ENROLL_MS = 1_000
 
-# Khi một cụm không có mảnh nào đủ một giây: vẫn lấy mảnh dài nhất từ mức này
-# trở lên. Mẫu ngắn thì vector kém chắc, nhưng ngưỡng cosine ở lớp 3 vẫn chặn —
-# còn không có mẫu thì lớp 3 tắt hẳn, tức là mất luôn cơ hội sửa lớp 1.
+# When a cluster has no piece reaching one second: still take its longest piece
+# from this length up. A short sample gives a weaker vector, but the cosine
+# threshold in layer 3 still blocks it — whereas with no sample at all layer 3
+# switches off entirely, which loses every chance of fixing layer 1.
 MIN_SAMPLE_MS = 400
 
-# Hai mảnh xa nhau nhất mà cosine vẫn trên mức này thì bản ghi chỉ có MỘT người.
-# Đo trên bộ nghiệm thu 30 ca: cùng người 0,54 tới 0,74, khác người 0,06 tới 0,27.
-# Lấy 0,40 cho vào giữa hai khoảng; đo lại khi có bản ghi thật trong xe.
+# If the two furthest-apart pieces still score above this cosine, the recording
+# holds only ONE person. Measured on the 30-case acceptance suite: same speaker
+# 0.54 to 0.74, different speakers 0.06 to 0.27. 0.40 sits between the two
+# ranges; re-measure once there are real in-car recordings.
 MAX_SAME_VOICE_COSINE = 0.40
 
-# Mảnh đủ để ĐEM RA SO trong bước cứu. Ngắn hơn mức lấy mẫu bình thường vì cái
-# hay bị nuốt đúng là lượt "ừ", "dạ" — bỏ nó đi thì không còn gì để cứu.
+# A piece long enough TO BE COMPARED during the rescue step. Shorter than the
+# normal enrollment length because what gets swallowed is exactly the "ừ", "dạ"
+# backchannel turns — drop those and there is nothing left to rescue.
 MIN_RESCUE_MS = 180
 
-# Câu cửa miệng của hai bên. Dùng khi kịch bản không khai giá trị nào phải đọc
-# lại — tức là không có căn cứ chắc hơn. Chấm theo HIỆU hai bên chứ không chỉ
-# đếm phía agent: "cảm ơn" một mình không nói lên ai là ai, "giúp tôi" thì có.
+# Stock phrases of each side, in Vietnamese: these strings are recognition data
+# for Vietnamese speech, not prose. Used when the scenario declares no value
+# that has to be read back — that is, when there is no firmer evidence. Scored
+# on the DIFFERENCE between the two sides, not by counting the agent side
+# alone: a bare "cảm ơn" says nothing about who is who, "giúp tôi" does.
 AGENT_CUES = (
     "tổng đài", "xin nghe", "em xin", "dạ em", "bên em", "quý khách",
     "em hỗ trợ", "em kiểm tra", "em xác nhận", "cảm ơn anh", "cảm ơn chị",
     "dạ", "vâng", " ạ",
 )
 
-# Người gọi là bên NHỜ VIỆC: câu của họ có người nhận lệnh ở cuối.
+# The caller is the side ASKING FOR something: their lines address someone who
+# will carry it out. Vietnamese cue strings, kept as data.
 CALLER_CUES = (
     "giúp tôi", "cho tôi", "tôi muốn", "tôi cần", "em ơi", "a lô",
     "gọi cho tôi", "của tôi",
@@ -80,7 +91,7 @@ CALLER_CUES = (
 
 
 class MonoSplitUnavailable(RuntimeError):
-    """Thiếu mô hình hoặc thư viện: gọi được nhưng không chạy được."""
+    """Missing model or library: importable but not runnable."""
 
 
 @dataclass(frozen=True)
@@ -88,8 +99,8 @@ class Labelled:
     start_ms: int
     end_ms: int
     speaker: Literal["caller", "agent"]
-    # Khoảng cách cosine giữa hai giả thuyết. Càng nhỏ càng đáng ngờ; giao diện
-    # đọc con số này để nói "nhãn suy đoán" thay vì im lặng.
+    # Cosine distance between the two hypotheses. The smaller, the more suspect;
+    # the UI reads this number to say "inferred label" instead of staying silent.
     margin: float
 
 
@@ -100,11 +111,11 @@ def _norm(text: str) -> str:
 def speech_energy_runs(
     pcm: bytes, frame_ms: int, min_speech_ms: int, bytes_per_ms: int
 ) -> list[dict[str, int]]:
-    """Quãng có tiếng nói, ngưỡng suy từ CHÍNH bản ghi.
+    """Speech runs, with the threshold derived from THIS recording.
 
-    Lấy phân vị 20 của năng lượng khung làm nền rồi nhân ba. Ghim một con số
-    tuyệt đối thì bản ghi thu nhỏ tiếng thành im hết, còn bản ghi ồn thì khoảng
-    lặng nào cũng thành tiếng nói.
+    Take the 20th percentile of frame energy as the floor, then multiply by
+    three. Pinning an absolute number makes a quietly recorded file come out
+    entirely silent, while in a noisy file every silence becomes speech.
     """
     frame_bytes = frame_ms * bytes_per_ms
     frames = [pcm[at : at + frame_bytes] for at in range(0, len(pcm) - frame_bytes + 1, frame_bytes)]
@@ -126,16 +137,16 @@ def speech_energy_runs(
 
 
 class MonoSpeakerSplitter:
-    """Ba lớp ở docstring đầu tệp. Mô hình nạp một lần, dùng lại cho mọi ca."""
+    """The three layers from the module docstring. Models loaded once, reused for every case."""
 
     def __init__(self, segmentation_model: str, embedding_model: str) -> None:
         for path in (segmentation_model, embedding_model):
             if not Path(path).is_file():
-                raise MonoSplitUnavailable(f"thiếu mô hình tách người nói: {path}")
+                raise MonoSplitUnavailable(f"missing speaker splitting model: {path}")
         try:
             import sherpa_onnx
-        except ImportError as exc:  # pragma: no cover - môi trường thiếu gói
-            raise MonoSplitUnavailable("chưa cài sherpa-onnx") from exc
+        except ImportError as exc:  # pragma: no cover - package missing in the environment
+            raise MonoSplitUnavailable("sherpa-onnx is not installed") from exc
         self._sherpa = sherpa_onnx
         self._diarizer = sherpa_onnx.OfflineSpeakerDiarization(
             sherpa_onnx.OfflineSpeakerDiarizationConfig(
@@ -148,8 +159,9 @@ class MonoSpeakerSplitter:
                 embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
                     model=embedding_model, num_threads=4
                 ),
-                # Hai bên: khách và agent. Để máy tự đoán số người thì một tiếng
-                # ho của người ngồi cạnh cũng thành người thứ ba.
+                # Two sides: caller and agent. Letting the model guess the
+                # number of speakers turns one cough from the person sitting
+                # next to them into a third speaker.
                 clustering=sherpa_onnx.FastClusteringConfig(num_clusters=2),
                 min_duration_on=0.2,
                 min_duration_off=0.3,
@@ -159,16 +171,16 @@ class MonoSpeakerSplitter:
             sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=embedding_model, num_threads=4)
         )
 
-    # ── lớp 1 ──────────────────────────────────────────────────────────────
+    # ── layer 1 ────────────────────────────────────────────────────────────
     def clusters(self, samples: Any) -> list[tuple[int, int, int]]:
-        """(start_ms, end_ms, cụm) của cả bản ghi, đã sắp theo thời gian."""
+        """(start_ms, end_ms, cluster) for the whole recording, sorted by time."""
         result = self._diarizer.process(samples).sort_by_start_time()
         return [
             (round(item.start * 1000), round(item.end * 1000), int(item.speaker))
             for item in result
         ]
 
-    # ── lớp 3 ──────────────────────────────────────────────────────────────
+    # ── layer 3 ────────────────────────────────────────────────────────────
     def embed(self, samples: Any) -> Any:
         import numpy as np
 
@@ -179,15 +191,16 @@ class MonoSpeakerSplitter:
         norm = float(np.linalg.norm(vector))
         return vector / norm if norm else vector
 
-    # ── lớp 1b ─────────────────────────────────────────────────────────────
+    # ── layer 1b ───────────────────────────────────────────────────────────
     def split_by_voice(
         self, samples: Any, pieces: list[tuple[int, int, int]]
     ) -> list[tuple[int, int, int]] | None:
-        """Cứu khi phân cụm mù gộp cả hai người thành một.
+        """Rescue when blind clustering merged both people into one.
 
-        Xảy ra khi một bên chỉ nói vài lượt rất ngắn, hoặc hai giọng gần nhau.
-        Lấy hai mảnh XA NHAU NHẤT theo vân giọng làm mốc rồi chia phần còn lại
-        theo mốc gần hơn. ``None`` = đúng là một người, đừng bịa ra người thứ hai.
+        Happens when one side speaks only a few very short turns, or when the
+        two voices are close. Take the two pieces FURTHEST APART by voice
+        embedding as anchors, then assign the rest to the nearer anchor.
+        ``None`` = it really is one person, do not invent a second one.
         """
         import numpy as np
 
@@ -197,8 +210,9 @@ class MonoSpeakerSplitter:
         vectors = {
             piece: self.embed(samples[piece[0] * 16 : piece[1] * 16]) for piece in usable
         }
-        # Cặp xa nhau nhất phải có ít nhất một mảnh đủ dài: hai mảnh vụn lệch
-        # nhau là chuyện thường của vân giọng, dựng người thứ hai từ đó là bịa.
+        # The furthest pair must contain at least one long enough piece: two
+        # tiny pieces disagreeing is ordinary voice-embedding noise, building a
+        # second person out of that is fabrication.
         pairs = [
             (a, b)
             for index, a in enumerate(usable)
@@ -223,23 +237,26 @@ class MonoSpeakerSplitter:
 
 
 
-# Mảnh ngắn hơn mức này sau khi cắt theo ranh giới cụm là vụn: nhập lại vào
-# mảnh bên cạnh. Một "lượt" 120 ms không phải lượt nói, nó là tiếng đệm.
+# A piece shorter than this after cutting on cluster boundaries is debris: merge
+# it back into the piece next to it. A 120 ms "turn" is not a turn, it is a
+# filler sound.
 MIN_PIECE_MS = 300
 
 
 def split_runs(
     runs: list[dict[str, int]], clusters: list[tuple[int, int, int]]
 ) -> list[tuple[int, int, int]]:
-    """Cắt quãng có tiếng tại chỗ ĐỔI NGƯỜI, trả (start, end, cụm).
+    """Cut speech runs where the SPEAKER CHANGES, returns (start, end, cluster).
 
-    Không có bước này thì một quãng khách-rồi-agent liền mạch (hai bên nói đè
-    nhau, VAD không thấy khoảng lặng nào để cắt) đi nguyên khối vào một nhãn
-    duy nhất: mất hẳn một lượt, và độ trễ đáp của lượt đó biến mất theo.
+    Without this step an unbroken caller-then-agent run (the two sides
+    overlapping, VAD finding no silence to cut on) goes into a single label as
+    one block: a whole turn is lost, and that turn's response latency goes with
+    it.
 
-    Gộp chỉ xảy ra TRONG một quãng. Hai quãng cách nhau bởi khoảng lặng là hai
-    lượt kể cả khi cùng cụm — nhập chúng lại là nuốt mất lượt nằm giữa mà lớp
-    vân giọng lẽ ra còn cơ hội chấm lại.
+    Merging only happens WITHIN a run. Two runs separated by silence are two
+    turns even when they share a cluster — merging them swallows the turn in
+    between, which the voice-embedding layer would otherwise still have had a
+    chance to re-score.
     """
     pieces: list[tuple[int, int, int]] = []
     for run in runs:
@@ -269,29 +286,32 @@ def split_runs(
     return pieces
 
 
-# Quãng chồng ngắn hơn mức này là vụn của biên chứ không phải một lần overlap:
-# mô hình phân đoạn có receptive field 991 mẫu (62 ms) nên mọi ranh giới đều
-# nhoè cỡ đó. Đo trên bộ mẫu: chồng thật 0,59 s bị báo 0,78 s.
+# An overlap shorter than this is boundary debris, not one instance of
+# overlapping speech: the segmentation model has a receptive field of 991
+# samples (62 ms), so every boundary is blurred by about that much. Measured on
+# the sample set: a real 0.59 s overlap was reported as 0.78 s.
 MIN_OVERLAP_MS = 150
 
 
 def overlap_spans(clusters: list[tuple[int, int, int]]) -> list[dict[str, int]]:
-    """Khoảng HAI CỤM cùng hoạt động — thứ ``split_runs`` xoá đi.
+    """Spans where TWO CLUSTERS are active at once — what ``split_runs`` erases.
 
-    Mô hình phân đoạn là powerset 7 lớp (``num_classes=7``,
-    ``powerset_max_classes=2``): ba lớp cuối là hai người nói cùng lúc, nên
-    ``OfflineSpeakerDiarization`` trả về các segment CHỒNG NHAU về thời gian.
-    ``split_runs`` cắt chúng thành mảnh kề nhau — cần thế để mỗi lượt có đúng
-    một nhãn — và đó là nơi dấu vết "hai người cùng nói" mất. Hàm này đọc trước
-    khi mất.
+    The segmentation model is a 7-class powerset (``num_classes=7``,
+    ``powerset_max_classes=2``): the last three classes are two people speaking
+    at once, so ``OfflineSpeakerDiarization`` returns segments that OVERLAP in
+    time. ``split_runs`` cuts them into adjacent pieces — needed so that each
+    turn carries exactly one label — and that is where the trace of "two people
+    speaking at once" is lost. This function reads it before it is lost.
 
-    ``cum_chen`` là cụm vào sau, ``cum_nhuong`` là cụm rời khoảng chồng trước;
-    ``-1`` khi hai mốc bằng nhau, vì khi đó không ai chen ai.
+    ``cum_chen`` is the cluster that comes in later, ``cum_nhuong`` the cluster
+    that leaves the overlap first; ``-1`` when the two marks are equal, because
+    then neither one cut in on the other.
 
-    Đây là PHỎNG ĐOÁN, không phải phép đo: quãng overlap dưới 200 ms bị bỏ sót
-    nhiều (F1 của OSD trên thoại điện thoại quanh 0,60 — DIHARD III) và biên
-    nhoè nên tổng thời lượng phình cỡ 1,4 lần. Đếm số lần và lấy mốc thì được;
-    cộng thành tổng số giây thì không.
+    This is INFERRED, not measured: overlaps under 200 ms are missed often (OSD
+    F1 on telephone speech is around 0.60 — DIHARD III) and the blurred
+    boundaries inflate the total duration by about 1.4x. Counting instances and
+    taking their timestamps works; adding them up into a total number of seconds
+    does not.
     """
     out: list[dict[str, int]] = []
     for index, (a_start, a_end, a_cluster) in enumerate(clusters):
@@ -315,20 +335,23 @@ def overlap_spans(clusters: list[tuple[int, int, int]]) -> list[dict[str, int]]:
 
 
 def co_bang_chung_hai_vai(spoken: list[tuple[int, str]], requirements: list[str]) -> bool:
-    """Có thật hai vai trong lời nói không — hỏi khi GIỌNG không trả lời được.
+    """Are there really two roles in the speech — asked when the VOICE cannot say.
 
-    Bản ghi tổng hợp hay để cả khách lẫn agent nói bằng một giọng, nên vân giọng
-    bó tay và nhãn phải gán luân phiên theo lượt. Nhưng "một giọng" cũng đúng
-    với bản ghi chỉ có MỘT người nói — và gán luân phiên ở đó là bịa ra người
-    thứ hai. Phân biệt bằng chữ, không bằng tiếng:
+    Synthesised recordings often have both caller and agent speaking in one
+    voice, so the voice embedding is helpless and the labels have to alternate
+    per turn. But "one voice" also fits a recording with only ONE person
+    speaking — and alternating labels there invents a second person. Tell them
+    apart by the words, not by the sound:
 
-    - hai nhóm nói ngược nhau về câu cửa miệng (một bên giọng tổng đài, một bên
-      giọng người nhờ việc), hoặc
-    - cùng một giá trị trong yêu cầu được CẢ HAI nhóm nói ra — tức có người đưa
-      tin và có người nhắc lại để xác nhận.
+    - the two groups pull in opposite directions on the stock phrases (one side
+      sounds like the contact centre, the other like someone asking for help),
+      or
+    - the same value from the requirements is spoken by BOTH groups — meaning
+      one side gave the information and the other read it back to confirm.
 
-    Không dấu hiệu nào thì trả ``False``: thà từ chối còn hơn chia đôi lời của
-    một người rồi chấm agent bằng chính câu của khách.
+    With neither sign present, return ``False``: better to refuse than to split
+    one person's speech in two and then score the agent with the caller's own
+    words.
     """
     normalized: dict[int, str] = {}
     for cluster, text in spoken:
@@ -351,28 +374,33 @@ def pick_agent_cluster(
     spoken: list[tuple[int, str]],
     requirements: list[str],
 ) -> tuple[int, str]:
-    """Cụm nào là agent, và vì sao. Quyết bằng LỜI chứ không bằng giọng.
+    """Which cluster is the agent, and why. Decided by WORDS, not by voice.
 
-    ``spoken`` là các mảnh tiếng THEO THỨ TỰ THỜI GIAN: (cụm, chữ đọc được).
-    Thứ tự là bằng chứng, không phải thứ trang trí — xem căn cứ 2.
+    ``spoken`` is the speech pieces IN TIME ORDER: (cluster, recovered text).
+    The order is evidence, not decoration — see ground 2.
 
-    Giọng agent do người dùng cấu hình nên không ghim trước được; vai thì lộ ra
-    trong chữ. Bốn căn cứ, chắc chắn giảm dần:
+    The agent voice is configured by the user, so it cannot be pinned in
+    advance; the role shows up in the text. Four grounds, in decreasing
+    certainty:
 
-    1. Cụm đọc ra **nhiều giá trị người dùng nêu trong yêu cầu** hơn — agent đọc
-       lại để xác nhận. Bản ghi vừa tải lên thường CHƯA có yêu cầu nào; khi đó
-       căn cứ này im và ba căn cứ dưới quyết.
-    2. Hai bên cùng đọc giá trị đó: bên đọc **SAU** là agent. Khách đưa thông
-       tin trước, agent nhắc lại để xác nhận — không bao giờ ngược lại.
-    3. **Hiệu** câu cửa miệng: câu của tổng đài trừ câu của người nhờ việc.
-       Đếm một phía thì "cảm ơn" của khách cũng thành bằng chứng buộc tội.
-    4. Cụm **nói lượt cuối** — agent là bên chốt cuộc gọi. Yếu nhất, nên lý do
-       trả về nói thẳng là suy đoán để giao diện hạ độ tin cậy.
+    1. The cluster that reads out **more of the values the user stated in the
+       requirements** — the agent reads them back to confirm. A freshly uploaded
+       recording usually has NO requirements yet; this ground then stays silent
+       and the three below decide.
+    2. Both sides read out the same value: the side that reads it **LATER** is
+       the agent. The caller gives the information first, the agent repeats it
+       to confirm — never the other way round.
+    3. The **difference** in stock phrases: contact centre lines minus
+       asking-for-help lines. Counting one side only turns the caller's "cảm ơn"
+       into incriminating evidence too.
+    4. The cluster that **speaks the last turn** — the agent is the side closing
+       the call. Weakest, so the returned reason says outright that it is a
+       guess, for the UI to lower the confidence.
     """
     order = [cluster for cluster, _text in spoken]
     keys = sorted(set(order))
     if len(keys) < 2:
-        return keys[0] if keys else 0, "chỉ nhận ra một giọng"
+        return keys[0] if keys else 0, "only one voice recognised"
     normalized: dict[int, str] = {}
     for cluster, text in spoken:
         normalized[cluster] = f"{normalized.get(cluster, '')} {_norm(text)}".strip()
@@ -386,7 +414,7 @@ def pick_agent_cluster(
         best, second = sorted(hits.values(), reverse=True)[:2]
         if best > second:
             cluster = max(hits, key=lambda key: hits[key])
-            return cluster, f"đọc lại {hits[cluster]}/{len(wanted)} giá trị kịch bản"
+            return cluster, f"reads back {hits[cluster]}/{len(wanted)} scripted values"
         if best > 0:
             said_at: dict[int, int] = {}
             for index, (cluster, text) in enumerate(spoken):
@@ -395,7 +423,7 @@ def pick_agent_cluster(
                     said_at.setdefault(cluster, index)
             if len(said_at) == 2:
                 cluster = max(said_at, key=lambda key: said_at[key])
-                return cluster, "nhắc lại giá trị kịch bản sau bên kia"
+                return cluster, "repeats the scripted value after the other side"
 
     cues = {
         cluster: sum(cue in text for cue in AGENT_CUES)
@@ -405,6 +433,6 @@ def pick_agent_cluster(
     best, second = sorted(cues.values(), reverse=True)[:2]
     if best > second:
         cluster = max(cues, key=lambda key: cues[key])
-        return cluster, f"hơn {best - second} câu cửa miệng tổng đài"
+        return cluster, f"{best - second} more contact centre stock phrases"
 
-    return order[-1], "đoán theo bên nói lượt cuối — căn cứ yếu, nên soát lại nhãn"
+    return order[-1], "guessed from the last turn speaker — weak evidence, re-check the labels"

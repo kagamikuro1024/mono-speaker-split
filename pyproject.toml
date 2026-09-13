@@ -1,26 +1,26 @@
 [project]
 name = "monosplit"
 version = "0.1.0"
-description = "Tách khách / agent khỏi bản ghi cuộc gọi một kênh — ba lớp, chạy CPU, không PyTorch"
+description = "Split caller / agent apart from a single-channel call recording — three layers, CPU-only, no PyTorch"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "numpy>=1.26",
-    # sherpa-onnx: pyannote segmentation 3.0 + vân giọng ERes2Net, cả hai chạy
-    # trên onnxruntime. Wheel vài MB, KHÔNG kéo theo PyTorch.
+    # sherpa-onnx: pyannote segmentation 3.0 + ERes2Net voice embedding, both
+    # running on onnxruntime. A few MB of wheel, does NOT pull in PyTorch.
     "sherpa-onnx>=1.13",
-    # Thư viện native mà `sherpa-onnx` nạp lúc import. Máy dev hay có sẵn nên
-    # dễ quên; thiếu nó thì `import sherpa_onnx` chết bằng
-    # "libonnxruntime.so: cannot open shared object file".
+    # Native library that `sherpa-onnx` loads at import time. Dev machines usually
+    # already have it, so it is easy to forget; without it `import sherpa_onnx`
+    # dies with "libonnxruntime.so: cannot open shared object file".
     "sherpa-onnx-core>=1.13",
 ]
 
 [project.optional-dependencies]
-# Chép lời. Không cài thì vẫn tách được vai, chỉ là lượt không có chữ — và lớp
-# 2 (chữ chọn vai) mất căn cứ, phải rơi về suy đoán theo thứ tự lượt.
+# Transcription. Without it roles are still separated, only the turns carry no text — and
+# layer 2 (text picks the role) loses its evidence and falls back to inferring from turn order.
 asr = ["faster-whisper>=1.1"]
-# Giao diện web.
+# Web UI.
 web = ["fastapi>=0.115", "uvicorn>=0.30", "python-multipart>=0.0.9"]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 

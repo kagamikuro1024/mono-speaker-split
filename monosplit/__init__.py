@@ -1,4 +1,4 @@
-"""monosplit — tách khách / agent khỏi một bản ghi cuộc gọi MỘT kênh."""
+"""monosplit — split caller / agent apart from a SINGLE-channel call recording."""
 
 from monosplit.models import ensure_models
 from monosplit.pipeline import Result, SeparationError, Transcriber, Turn, separate

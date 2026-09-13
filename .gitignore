@@ -6,10 +6,10 @@ build/
 *.egg-info/
 .cache/
 
-# Kết quả một lần chạy benchmark, sinh lại được từ bộ âm thanh.
+# One benchmark run's output; regenerated from the audio set.
 benchmark/report.json
 
-# Bản ghi cuộc gọi: dữ liệu thật của người thật, không đẩy lên repo.
+# Call recordings: real people's real data, never pushed to the repo.
 *.wav
 *.m4a
 *.mp3

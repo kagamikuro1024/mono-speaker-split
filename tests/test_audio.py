@@ -1,8 +1,8 @@
-"""Câu hỏi «tệp này có hai luồng tiếng thật không» phải trả lời đúng.
+"""The question "does this file really carry two streams of speech" must be answered right.
 
-Trả lời sai theo hướng nào cũng hỏng: tưởng stereo giả là thật thì mỗi câu bị
-gán cho cả hai vai cùng mốc thời gian; tưởng stereo thật là giả thì vứt đi
-thông tin chắc chắn nhất có trong tệp để đi đoán.
+A wrong answer in either direction breaks the run: treating fake stereo as real assigns every
+sentence to both roles at the same timestamp; treating real stereo as fake throws away the most
+reliable information in the file and goes guessing instead.
 """
 
 from __future__ import annotations
@@ -23,44 +23,44 @@ def tone(freq: float, ms: int, amplitude: int = 8000, phase: float = 0.0) -> byt
     return (np.sin(2 * np.pi * freq * t + phase) * amplitude).astype(np.int16).tobytes()
 
 
-def test_mono_nhan_doi_thanh_stereo_la_mot_luong():
+def test_mono_duplicated_into_stereo_is_one_stream():
     wave = tone(180, 500)
     assert one_stream_only(wave, wave) is True
 
 
-def test_lech_nho_do_nen_van_la_mot_luong():
-    """Nén mất mát làm hai kênh lệch chút xíu — vẫn là một luồng."""
+def test_small_codec_drift_is_still_one_stream():
+    """Lossy compression makes the two channels differ slightly — still one stream."""
     wave = np.frombuffer(tone(180, 500), dtype=np.int16).astype(np.int32)
     noisy = (wave + np.random.default_rng(7).integers(-20, 20, wave.size)).astype(np.int16)
     assert one_stream_only(wave.astype(np.int16).tobytes(), noisy.tobytes()) is True
 
 
-def test_mot_ben_cam_la_mot_luong():
+def test_one_muted_channel_is_one_stream():
     wave = tone(180, 500)
     assert one_stream_only(wave, pcm([0] * (len(wave) // 2))) is True
 
 
-def test_hai_kenh_khac_nhau_la_hai_luong():
+def test_two_different_channels_are_two_streams():
     assert one_stream_only(tone(180, 500), tone(320, 500, phase=1.1)) is False
 
 
-def test_ca_hai_kenh_cam_khong_phai_chuyen_tach_vai():
-    """Tệp câm là lỗi «không có tiếng nói», không phải lỗi «một luồng»."""
+def test_both_channels_silent_is_not_a_role_split_case():
+    """A silent file is a "no speech" error, not a "one stream" error."""
     silence = pcm([0] * 8000)
     assert one_stream_only(silence, silence) is False
 
 
-def test_chenh_lech_do_duoc_de_in_bao_cao():
+def test_channel_difference_is_measured_for_the_report():
     wave = tone(180, 300)
     assert channel_difference(wave, wave) == 0.0
     assert channel_difference(wave, tone(320, 300, phase=1.1)) > 0.5
 
 
-def test_cat_doan_theo_moc_thoi_gian():
-    """32 byte mỗi mili giây: cắt theo mốc là cắt byte, không lệch một mẫu."""
+def test_slicing_follows_the_millisecond_marks():
+    """32 bytes per millisecond: slicing by mark is slicing by byte, not off by one sample."""
     wave = tone(180, 1000)
     assert len(slice_pcm(wave, 100, 200)) == 100 * 32
 
 
-def test_dang_song_co_mot_diem_moi_khung():
+def test_waveform_has_one_point_per_frame():
     assert len(peak_levels(tone(180, 200), frame_ms=20)) == 10

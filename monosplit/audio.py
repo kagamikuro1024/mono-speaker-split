@@ -1,10 +1,11 @@
-"""Đọc tệp âm thanh thành PCM, và trả lời một câu hỏi hay bị bỏ qua:
-tệp này có THẬT là hai kênh tách vai không.
+"""Decode audio files into PCM, and answer a question that often gets skipped:
+is this file REALLY two channels carrying one role each.
 
-Số kênh trong metadata không nói lên điều đó. Rất nhiều bản ghi "stereo" là
-mono nhân đôi, hoặc thu một bên còn bên kia câm. Đi đường hai kênh với những
-tệp đó thì mỗi câu bị phiên âm hai lần và gán cho cả hai vai với CÙNG mốc thời
-gian — một bản gỡ băng nhìn thì đầy đủ mà vô nghĩa.
+The channel count in the metadata does not answer that. Plenty of "stereo"
+recordings are duplicated mono, or have one side recorded while the other is
+silent. Sending those down the two-channel path transcribes every sentence
+twice and assigns it to both roles with the SAME timestamps — a transcript that
+looks complete and means nothing.
 """
 
 from __future__ import annotations
@@ -15,34 +16,35 @@ from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
-# Whisper ăn 16 kHz; PCM s16le mono ở mức này là 32 byte mỗi mili giây, nên cắt
-# một đoạn theo mốc thời gian chỉ là cắt byte.
+# Whisper takes 16 kHz; mono PCM s16le at that rate is 32 bytes per millisecond,
+# so slicing a span by timestamp is just slicing bytes.
 TARGET_SAMPLE_RATE = 16_000
 PCM_BYTES_PER_MS = TARGET_SAMPLE_RATE * 2 // 1000
 
-# Hai kênh "giống nhau đến mức này" thì coi là một luồng. Đo trên bộ mẫu: mono
-# nhân đôi lệch 0,000–0,007% biên độ, bản ghi hai kênh thật lệch 180–196%.
-# 2% nằm giữa hai khoảng và chịu được sai số nén.
+# Two channels "this similar" count as a single stream. Measured on the sample
+# set: duplicated mono differs by 0.000-0.007% of amplitude, a real two-channel
+# recording differs by 180-196%. 2% sits between the two ranges and absorbs
+# compression error.
 SAME_STREAM_RATIO = 0.02
 
-# Một kênh câm: nhỏ hơn 1% kênh kia thì nó không mang lời của ai.
+# A silent channel: below 1% of the other one it carries nobody's speech.
 SILENT_CHANNEL_RATIO = 0.01
 
 
 class AudioError(RuntimeError):
-    """Không đọc được tệp, hoặc tệp không dùng được cho việc tách giọng."""
+    """The file cannot be read, or is unusable for speaker splitting."""
 
 
 @dataclass(frozen=True)
 class Probe:
-    """Những gì biết được trước khi tốn công giải mã cả tệp."""
+    """What can be known before spending effort decoding the whole file."""
 
     channels: int
     duration_ms: int
 
 
 def probe(source: Path) -> Probe:
-    """Số kênh và độ dài, đọc từ header."""
+    """Channel count and duration, read from the header."""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
          "-show_entries", "stream=channels:format=duration", "-of", "json", str(source)],
@@ -51,7 +53,7 @@ def probe(source: Path) -> Probe:
         check=False,
     )
     if result.returncode != 0:
-        raise AudioError(f"ffprobe không đọc được tệp: {source}")
+        raise AudioError(f"ffprobe could not read the file: {source}")
     try:
         payload = json.loads(result.stdout)
         return Probe(
@@ -59,11 +61,11 @@ def probe(source: Path) -> Probe:
             duration_ms=round(float(payload["format"]["duration"]) * 1000),
         )
     except (KeyError, IndexError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise AudioError(f"tệp không có luồng âm thanh đọc được: {source}") from exc
+        raise AudioError(f"file has no readable audio stream: {source}") from exc
 
 
 def decode_mono(source: Path, dest: Path) -> bytes:
-    """Trộn mọi kênh xuống một kênh 16 kHz PCM s16le và trả về byte."""
+    """Mix every channel down to one 16 kHz PCM s16le channel and return the bytes."""
     result = subprocess.run(
         ["ffmpeg", "-v", "error", "-y", "-i", str(source), "-ac", "1",
          "-ar", str(TARGET_SAMPLE_RATE), "-c:a", "pcm_s16le", str(dest)],
@@ -72,12 +74,12 @@ def decode_mono(source: Path, dest: Path) -> bytes:
         check=False,
     )
     if result.returncode != 0:
-        raise AudioError(result.stderr.decode("utf-8", "replace")[:500] or "ffmpeg lỗi")
+        raise AudioError(result.stderr.decode("utf-8", "replace")[:500] or "ffmpeg error")
     return _read_pcm(dest)
 
 
 def decode_channels(source: Path, work: Path) -> tuple[bytes, bytes]:
-    """Tách kênh trái / phải thành hai luồng PCM riêng."""
+    """Split the left / right channels into two separate PCM streams."""
     left, right = work / "left.wav", work / "right.wav"
     rate = str(TARGET_SAMPLE_RATE)
     result = subprocess.run(
@@ -90,16 +92,17 @@ def decode_channels(source: Path, work: Path) -> tuple[bytes, bytes]:
         check=False,
     )
     if result.returncode != 0:
-        raise AudioError(result.stderr.decode("utf-8", "replace")[:500] or "ffmpeg lỗi")
+        raise AudioError(result.stderr.decode("utf-8", "replace")[:500] or "ffmpeg error")
     return _read_pcm(left), _read_pcm(right)
 
 
 def one_stream_only(left: bytes, right: bytes) -> bool:
-    """Hai kênh có thực chất chỉ là MỘT luồng tiếng hay không.
+    """Whether the two channels are really just ONE speech stream.
 
-    Trả ``True`` khi hai kênh trùng nhau hoặc một kênh câm — cả hai trường hợp
-    đều phải đi đường một kênh. Cả hai kênh đều câm trả ``False``: đó là tệp
-    không có tiếng nói, một lỗi khác hẳn, và gọi tên đúng lỗi mới sửa được.
+    Returns ``True`` when the two channels are identical or one is silent — both
+    cases must take the single-channel path. Two silent channels return
+    ``False``: that is a file with no speech at all, an entirely different
+    failure, and only naming the failure correctly makes it fixable.
     """
     import numpy as np
 
@@ -117,7 +120,7 @@ def one_stream_only(left: bytes, right: bytes) -> bool:
 
 
 def channel_difference(left: bytes, right: bytes) -> float:
-    """Chênh lệch trung bình giữa hai kênh, theo tỉ lệ biên độ. Để in ra báo cáo."""
+    """Mean difference between the two channels, as a fraction of amplitude. For the report."""
     import numpy as np
 
     l_pcm = np.frombuffer(left, dtype=np.int16).astype(np.float32)
@@ -135,20 +138,20 @@ def slice_pcm(pcm: bytes, start_ms: int, end_ms: int) -> bytes:
 
 
 def _read_pcm(path: Path) -> bytes:
-    """Bỏ 44 byte header WAV, giữ mẫu thô."""
+    """Drop the 44-byte WAV header, keep the raw samples."""
     raw = path.read_bytes()
     return raw[44:] if raw[:4] == b"RIFF" else raw
 
 
 def to_samples(pcm: bytes):
-    """PCM s16le → mảng float32 trong [-1, 1] cho các mô hình ONNX."""
+    """PCM s16le → float32 array in [-1, 1] for the ONNX models."""
     import numpy as np
 
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def peak_levels(pcm: bytes, frame_ms: int = 20) -> list[int]:
-    """Biên độ đỉnh mỗi khung — dùng vẽ dạng sóng ở giao diện."""
+    """Peak amplitude per frame — used to draw the waveform in the UI."""
     frame_bytes = frame_ms * PCM_BYTES_PER_MS
     return [
         max((abs(value) for value in array("h", pcm[at : at + frame_bytes])), default=0)

@@ -1,7 +1,8 @@
-"""Dòng lệnh: một tệp vào, bảng lượt nói ra.
+"""Command line: one file in, a table of turns out.
 
-Mọi thứ nặng (mô hình ONNX, Whisper) chỉ nạp khi thật sự cần, để `--help` và
-lỗi tham số trả lời tức thì thay vì đợi vài giây nạp mô hình.
+Everything heavy (the ONNX models, Whisper) is loaded only when genuinely
+needed, so `--help` and argument errors answer instantly instead of waiting
+seconds for a model to load.
 """
 
 from __future__ import annotations
@@ -13,12 +14,13 @@ from pathlib import Path
 
 from monosplit.models import ensure_models
 from monosplit.pipeline import Result, SeparationError, separate
+from monosplit.separate_voices import SeparatorUnavailable, VoiceSeparator
 from monosplit.speakers import MonoSpeakerSplitter, MonoSplitUnavailable
 from monosplit.transcribe import Transcriber, TranscriberUnavailable
 
-VAI = {"caller": "Khách", "agent": "Agent"}
+VAI = {"caller": "Caller", "agent": "Agent"}
 
-# Cắt lời trong bảng cho khỏi tràn dòng; ai cần đủ chữ thì dùng --json.
+# Truncate the text in the table so rows do not wrap; use --json for the full text.
 LOI_TOI_DA = 64
 
 
@@ -27,8 +29,8 @@ def _dong_ho(ms: int) -> str:
 
 
 def _bang(result: Result) -> str:
-    """Bảng thuần văn bản, cột co theo nội dung thật."""
-    dau = ("STT", "Vai", "Bắt đầu", "Kết thúc", "Độ dài", "Margin", "Lời")
+    """Plain-text table, columns sized to the actual content."""
+    dau = ("#", "Role", "Start", "End", "Length", "Margin", "Text")
     dong = [
         (
             str(i),
@@ -41,8 +43,8 @@ def _bang(result: Result) -> str:
         )
         for i, turn in enumerate(result.turns, 1)
     ]
-    # Đo bằng len() chứ không bằng bề rộng hiển thị: chữ Việt có dấu vẫn là một
-    # ô trên terminal, nên len() đủ đúng ở đây.
+    # Measured with len() rather than display width: Vietnamese diacritics still
+    # take one terminal cell, so len() is accurate enough here.
     rong = [max(len(hang[c]) for hang in (dau, *dong)) for c in range(len(dau))]
     ke = lambda hang: "  ".join(o.ljust(w) for o, w in zip(hang, rong, strict=True)).rstrip()  # noqa: E731
     return "\n".join([ke(dau), "  ".join("-" * w for w in rong), *(ke(hang) for hang in dong)])
@@ -51,53 +53,76 @@ def _bang(result: Result) -> str:
 def _in_ket_qua(result: Result) -> None:
     print(_bang(result))
     print()
-    print(f"Nguồn      : {result.source}  ({result.duration_ms / 1000:.1f}s, {result.channels} kênh)")
-    print(f"Đường chạy : {result.mode}")
-    print(f"Chọn vai   : {result.role_reason or '—'}")
+    print(f"Source     : {result.source}  ({result.duration_ms / 1000:.1f}s, {result.channels} channels)")
+    print(f"Route      : {result.mode}")
+    print(f"Role choice: {result.role_reason or '—'}")
     if result.overlaps:
-        # Số lần và mốc, KHÔNG tổng số giây: biên của mô hình nhoè ±62 ms nên
-        # cộng lại là bịa ra một con số chính xác hơn thứ đo được.
-        print(f"Nghi có overlap: {len(result.overlaps)} lần (phỏng đoán, không phải phép đo)")
+        # Count and timestamps, NOT a total in seconds: the model's boundaries are
+        # fuzzy to ±62 ms, so summing them invents a number more precise than
+        # anything that was measured.
+        print(f"Suspected overlap: {len(result.overlaps)} time(s) (inferred, not measured)")
         for span in result.overlaps:
             ai = span["who_cut_in"]
-            huong = f" — {VAI[ai]} chen vào" if ai in VAI else ""
+            huong = f" — {VAI[ai]} cut in" if ai in VAI else ""
             print(f"             {span['start_ms'] / 1000:.1f}s{huong}")
+            # Words separated out of the overlap. Printed under the timestamp
+            # and marked "recovered": the separator can leak one voice into the
+            # other stream, so this is a lead for a human to confirm, not a
+            # measurement to trust.
+            for line in span.get("recovered") or []:
+                who = VAI.get(line["role"], "unknown speaker")
+                print(f"               recovered [{who}]: {line['text']}")
     if result.same_voice:
-        print("Lưu ý      : hai bên nghe như một giọng")
+        print("Note       : both sides sound like one voice")
     for canh_bao in result.warnings:
-        print(f"Cảnh báo   : {canh_bao}")
+        print(f"Warning    : {canh_bao}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="monosplit",
-        description="Tách giọng khách / agent khỏi bản ghi cuộc gọi một kênh.",
+        description="Split the caller / agent voices out of a single-channel call recording.",
     )
-    parser.add_argument("audio", type=Path, help="tệp âm thanh cần tách")
-    parser.add_argument("--json", action="store_true", help="in JSON thay vì bảng")
-    parser.add_argument("--no-asr", action="store_true", help="bỏ chép lời cho nhanh")
-    parser.add_argument("--models", type=Path, default=None, help="thư mục chứa seg.onnx / emb.onnx")
-    parser.add_argument("--model", default="small", help="tên mô hình Whisper (mặc định: small)")
+    parser.add_argument("audio", type=Path, help="audio file to split")
+    parser.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    parser.add_argument("--no-asr", action="store_true", help="skip transcription for speed")
+    parser.add_argument("--models", type=Path, default=None, help="directory holding seg.onnx / emb.onnx")
+    parser.add_argument("--model", default="small", help="Whisper model name (default: small)")
     parser.add_argument(
         "--requirement",
         action="append",
         default=[],
-        metavar="CÂU",
-        help="mô tả việc agent phải làm, giúp lớp 2 chọn vai; lặp lại được",
+        metavar="SENTENCE",
+        help="describe what the agent must do, helps layer 2 pick the roles; repeatable",
+    )
+    parser.add_argument(
+        "--separator",
+        type=Path,
+        default=None,
+        metavar="MODEL.onnx",
+        help="SepFormer ONNX model; recovers the words spoken during overlaps "
+        "(measured: caller CER 0.68 -> 0.33 on the 30-case suite)",
+    )
+    parser.add_argument(
+        "--separator-rate",
+        type=int,
+        default=16_000,
+        help="sample rate the separator was trained at (default: 16000). A wrong "
+        "value still produces audio, just pitch-shifted and unreadable by ASR",
     )
     args = parser.parse_args(argv)
 
     if not args.audio.is_file():
-        print(f"Không thấy tệp: {args.audio}", file=sys.stderr)
+        print(f"File not found: {args.audio}", file=sys.stderr)
         return 1
 
     try:
         seg, emb = ensure_models(args.models)
         splitter = MonoSpeakerSplitter(str(seg), str(emb))
     except MonoSplitUnavailable as exc:
-        print(f"Thiếu mô hình tách người nói: {exc}", file=sys.stderr)
-        print("Cài: uv pip install 'monosplit'  — mô hình tự tải về ~/.cache/monosplit", file=sys.stderr)
-        print("Hoặc trỏ MONOSPLIT_MODELS / --models tới thư mục có seg.onnx và emb.onnx.", file=sys.stderr)
+        print(f"Missing speaker diarization model: {exc}", file=sys.stderr)
+        print("Install: uv pip install 'monosplit'  — models download to ~/.cache/monosplit", file=sys.stderr)
+        print("Or point MONOSPLIT_MODELS / --models at a folder with seg.onnx and emb.onnx.", file=sys.stderr)
         return 1
 
     transcriber = None
@@ -105,14 +130,25 @@ def main(argv: list[str] | None = None) -> int:
         try:
             transcriber = Transcriber(args.model)
         except TranscriberUnavailable:
-            print("Chưa cài faster-whisper nên không chép lời được.", file=sys.stderr)
-            print("Cài: uv pip install 'monosplit[asr]'  — hoặc chạy lại với --no-asr.", file=sys.stderr)
+            print("faster-whisper is not installed, so transcription is unavailable.", file=sys.stderr)
+            print("Install: uv pip install 'monosplit[asr]'  — or rerun with --no-asr.", file=sys.stderr)
+            return 1
+
+    voice_separator = None
+    if args.separator is not None:
+        if transcriber is None:
+            print("--separator needs transcription; drop --no-asr.", file=sys.stderr)
+            return 1
+        try:
+            voice_separator = VoiceSeparator(args.separator, args.separator_rate)
+        except SeparatorUnavailable as exc:
+            print(f"Cannot load the separator: {exc}", file=sys.stderr)
             return 1
 
     try:
-        result = separate(args.audio, splitter, transcriber, args.requirement)
+        result = separate(args.audio, splitter, transcriber, args.requirement, voice_separator)
     except SeparationError as exc:
-        print(f"Không tách được: {exc}", file=sys.stderr)
+        print(f"Could not split: {exc}", file=sys.stderr)
         return 1
 
     if args.json:

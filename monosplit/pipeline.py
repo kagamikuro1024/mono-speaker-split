@@ -1,25 +1,31 @@
-"""Đường chạy đầy đủ: một tệp âm thanh vào, danh sách lượt nói có nhãn vai ra.
+"""The whole run: one audio file in, a list of role-labelled turns out.
 
-Bốn bước, và bước nào cũng có thể nói "không làm được" thay vì đoán bừa:
+Five steps, and every one of them can say "not measurable" instead of guessing:
 
-1. ``audio``  — đọc tệp, quyết định nó là một luồng hay hai luồng thật.
-2. ``speakers`` lớp 1 — phân cụm mù, cắt quãng tại chỗ đổi người.
-3. ``transcribe`` — chép lời, mốc theo từ (tuỳ chọn).
-4. ``speakers`` lớp 2 + 3 — chữ chọn vai, vân giọng chấm lại từng quãng.
+1. ``audio``  - read the file, decide whether it is one stream or two real ones.
+2. ``speakers`` layer 1 - blind clustering, cut speech runs where the speaker
+   changes.
+3. ``transcribe`` - words with per-word timestamps (optional).
+4. ``speakers`` layers 2 + 3 - words pick the role, voice embeddings re-score
+   every run.
+5. ``separate_voices`` - recover the words spoken while both people talked at
+   once (optional; needs a separator model).
 
-Nguyên tắc xuyên suốt: **nhãn trên bản ghi một kênh là SUY ĐOÁN**, và kết quả
-phải nói ra điều đó. Một bản gỡ băng trông chắc chắn mà sai vai còn tệ hơn một
-bản ghi rõ "chưa chắc, soát lại".
+The rule that runs through all of it: **a role label on a single-channel
+recording is INFERRED**, and the result has to say so. A transcript that looks
+certain but has the roles swapped is worse than one that says "unsure, check".
 """
 
 from __future__ import annotations
 
 import tempfile
+import wave
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from monosplit import audio
+from monosplit.separate_voices import MIN_SEPARATE_MS, recover_overlap_text
 from monosplit.speakers import (
     MIN_COSINE_MARGIN,
     MIN_ENROLL_MS,
@@ -35,15 +41,15 @@ from monosplit.speakers import (
 )
 from monosplit.transcribe import Transcriber, words_per_piece
 
-# Khung VAD và ngưỡng lượt — cùng bộ số với đường hai kênh để hai đường cho ra
-# cùng một dòng thời gian trên cùng một bản ghi.
+# VAD frame and turn thresholds - the same numbers as the two-channel path, so
+# both paths produce the same timeline for the same recording.
 VAD_FRAME_MS = 20
 MIN_SPEECH_MS = 200
 TURN_MERGE_GAP_MS = 400
 
 
 class SeparationError(RuntimeError):
-    """Không tách được — kèm mã lỗi để phía gọi hiện đúng câu cho người dùng."""
+    """Cannot separate - carries an error code so callers show the right text."""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -51,22 +57,23 @@ class SeparationError(RuntimeError):
 
 
 ERRORS: dict[str, str] = {
-    "khong_co_tieng_noi": "Bản ghi gần như không có tiếng nói nào.",
-    "khong_tach_nguoi_noi": "Chỉ nghe ra một giọng, không tách được hai vai.",
-    "thieu_mo_hinh": "Chưa có mô hình tách người nói (seg.onnx / emb.onnx).",
+    "khong_co_tieng_noi": "This recording has almost no speech in it.",
+    "khong_tach_nguoi_noi": "Only one voice was heard; the two roles cannot be separated.",
+    "thieu_mo_hinh": "No speaker-separation model available (seg.onnx / emb.onnx).",
 }
 
 
 @dataclass
 class Turn:
-    """Một lượt nói: ai, từ đâu đến đâu, nói gì, và tin được bao nhiêu."""
+    """One turn: who spoke, from when to when, what they said, how sure we are."""
 
     speaker: Literal["caller", "agent"]
     start_ms: int
     end_ms: int
     text: str = ""
-    #: Khoảng cách cosine giữa hai vân giọng ở quãng này. 0 = lớp 3 không chấm
-    #: (thiếu mẫu), dưới 0,10 = hai giọng quá sát, nhãn giữ theo lớp 1.
+    #: Cosine margin between the two voice embeddings on this run. 0 = layer 3
+    #: did not score it (no enrollment sample); below 0.10 = the voices are too
+    #: close, so the label stays as layer 1 left it.
     margin: float = 0.0
 
     @property
@@ -76,26 +83,29 @@ class Turn:
 
 @dataclass
 class Result:
-    """Kết quả một lần tách, đủ để vẽ giao diện và để chấm điểm benchmark."""
+    """One separation result, enough to draw the UI and to score the benchmark."""
 
     source: str
     duration_ms: int
     channels: int
-    #: Vì sao đi đường một kênh: `mono`, `stereo_trung_nhau`, `stereo_mot_ben_cam`.
+    #: Why the single-channel path was taken: `mono`, `stereo_trung_nhau`,
+    #: `stereo_mot_ben_cam`.
     mode: str
     turns: list[Turn] = field(default_factory=list)
-    #: Câu giải thích lớp 2 đã chọn agent bằng căn cứ nào.
+    #: How layer 2 decided which cluster is the agent.
     role_reason: str = ""
-    #: Hai bên nghe như một giọng — nhãn gán luân phiên theo lượt.
+    #: Both sides sound like one voice - labels alternate by turn order.
     same_voice: bool = False
-    #: Cảnh báo cho người đọc kết quả.
+    #: Warnings for whoever reads the result.
     warnings: list[str] = field(default_factory=list)
-    #: Các lần NGHI hai bên cùng nói, đọc từ lớp powerset của mô hình phân đoạn.
-    #: Mỗi mục: `start_ms`, `duration_ms`, `who_cut_in`, `who_yielded` (tên vai,
-    #: `None` khi không suy được hướng).
+    #: Moments where both sides are SUSPECTED to have spoken at once, read from
+    #: the segmentation model's powerset layer. Each item: `start_ms`,
+    #: `duration_ms`, `who_cut_in`, `who_yielded` (role names, `None` when the
+    #: direction cannot be inferred), and `recovered` - the words separated out
+    #: of that overlap, or `None` when it was too short to separate.
     #:
-    #: PHỎNG ĐOÁN, không phải phép đo — xem `speakers.overlap_spans`. Dùng số
-    #: lần và mốc; đừng cộng `duration_ms` thành tổng số giây overlap.
+    #: INFERRED, not measured - see `speakers.overlap_spans`. Use the count and
+    #: the timestamps; do not add `duration_ms` up into a total overlap time.
     overlaps: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -110,8 +120,15 @@ def separate(
     splitter: MonoSpeakerSplitter,
     transcriber: Transcriber | None = None,
     requirements: list[str] | None = None,
+    voice_separator: Any | None = None,
 ) -> Result:
-    """Tách một tệp thành các lượt nói có nhãn khách / agent."""
+    """Split one file into turns labelled caller / agent.
+
+    ``voice_separator`` is optional: pass a ``separate_voices.VoiceSeparator``
+    and every overlap at least ``MIN_SEPARATE_MS`` long also comes back with
+    the words recovered from it. It needs ``transcriber`` too - there is no
+    point separating audio nobody is going to read.
+    """
     requirements = requirements or []
     info = audio.probe(source)
 
@@ -123,8 +140,8 @@ def separate(
             if not audio.one_stream_only(left, right):
                 raise SeparationError(
                     "hai_kenh_that",
-                    "Tệp này có hai kênh tách vai thật — dùng thẳng từng kênh, "
-                    "không cần đoán ai với ai.",
+                    "This file has two real per-role channels - use each channel "
+                    "directly, there is nothing to infer.",
                 )
             import numpy as np
 
@@ -152,22 +169,23 @@ def separate(
         labels, reason = _label(splitter, samples, pieces, texts, requirements)
         warnings: list[str] = []
         if same_voice:
-            # Bản ghi tổng hợp hay dùng CÙNG MỘT giọng cho cả hai vai: vân giọng
-            # không phân biệt được ai với ai. Dữ kiện thật còn lại là THỨ TỰ
-            # LƯỢT — nhưng chỉ dùng được khi chính lời nói cho thấy có hai vai,
-            # vì "một giọng" cũng đúng với bản ghi chỉ có một người nói.
+            # Synthetic recordings often use ONE voice for both roles: voice
+            # embeddings then tell nobody apart. The only real evidence left is
+            # TURN ORDER - usable only when the words themselves show two roles,
+            # because "one voice" also describes a recording of one person.
             spoken = [(cluster, text) for (_s, _e, cluster), text in zip(pieces, texts, strict=True)]
             if not co_bang_chung_hai_vai(spoken, requirements):
                 raise SeparationError("khong_tach_nguoi_noi", ERRORS["khong_tach_nguoi_noi"])
-            warnings.append("hai bên nghe như một giọng — nhãn gán luân phiên theo lượt")
+            warnings.append("both sides sound like one voice - labels alternate by turn order")
 
         turns = [
             Turn(label.speaker, label.start_ms, label.end_ms, text, label.margin)
             for label, text in zip(labels, texts, strict=True)
         ]
 
-        # Cụm là số, người đọc cần tên vai: lấy mapping từ chính nhãn lớp 2 —
-        # cụm nào đóng góp nhiều thời lượng nhất cho một vai thì thuộc vai đó.
+        # Clusters are numbers, readers need role names: take the mapping from
+        # layer 2's own labels - a cluster belongs to whichever role it
+        # contributes the most speech time to.
         by_cluster: dict[tuple[int, str], int] = {}
         for (start, end, cluster), label in zip(pieces, labels, strict=True):
             key = (cluster, label.speaker)
@@ -186,6 +204,18 @@ def separate(
             }
             for span in spans
         ]
+        if voice_separator is not None and transcriber is not None:
+            # The mixture swallowed whoever was quieter. Separate a window
+            # around each overlap and read the streams back - words only: the
+            # timestamps still come from the original waveform, never from a
+            # separated stream (its clock starts at the padded window edge).
+            overlaps = recover_overlap_text(
+                overlaps,
+                samples,
+                separator=voice_separator,
+                transcribe=lambda track: _transcribe_track(transcriber, track, work),
+                embed=splitter.embed,
+            )
         if transcriber is not None:
             turns = [turn for turn in turns if turn.text] or turns
 
@@ -205,23 +235,26 @@ def separate(
 def _pieces(
     splitter: MonoSpeakerSplitter, samples, runs
 ) -> tuple[list[tuple[int, int, int]], bool, list[dict[str, int]]]:
-    """Lớp 1: phân cụm mù, cắt quãng tại chỗ đổi người, cứu nếu gom hụt.
+    """Layer 1: blind clustering, cut runs where the speaker changes, rescue if
+    the clustering swallowed one side.
 
-    Phần tử thứ ba là các khoảng hai cụm cùng hoạt động, đọc TRƯỚC khi
-    ``split_runs`` cắt chúng thành mảnh kề nhau.
+    The third element holds the spans where both clusters are active, read
+    BEFORE ``split_runs`` cuts them into adjacent pieces.
     """
     clusters = splitter.clusters(samples)
     spans = overlap_spans(clusters)
     pieces = split_runs(runs, clusters)
     if len({piece[2] for piece in pieces}) >= 2:
         return pieces, False, spans
-    # Phân cụm mù nuốt mất một bên — hay gặp khi một bên chỉ "ừ", "dạ". Thử lại
-    # bằng vân giọng trước khi kết luận chỉ có một giọng.
+    # Blind clustering swallowed one side - common when one party only says
+    # "yeah", "uh-huh". Retry with voice embeddings before concluding there is
+    # only one voice.
     rescued = splitter.split_by_voice(samples, pieces)
     if rescued is not None and len({piece[2] for piece in rescued}) >= 2:
         return rescued, False, spans
-    # Gán luân phiên thì số cụm hết nghĩa: giữ mốc, bỏ hướng chen — suy "ai chen
-    # ai" từ một mapping đã hỏng là bịa.
+    # Once labels alternate, cluster numbers mean nothing: keep the timestamps,
+    # drop the direction - inferring "who cut in on whom" from a broken mapping
+    # would be making it up.
     return (
         [(start, end, index % 2) for index, (start, end, _c) in enumerate(pieces)],
         True,
@@ -236,7 +269,7 @@ def _label(
     texts: list[str],
     requirements: list[str],
 ) -> tuple[list[Labelled], str]:
-    """Lớp 2 (chữ chọn vai) và lớp 3 (vân giọng chấm lại từng quãng)."""
+    """Layer 2 (words pick the role) and layer 3 (embeddings re-score each run)."""
     import numpy as np
 
     agent_cluster, reason = pick_agent_cluster(
@@ -244,10 +277,11 @@ def _label(
         requirements,
     )
 
-    # Mẫu giọng: mảnh DÀI NHẤT của mỗi cụm. Mảnh dài thì phần lẫn giọng bên kia
-    # bị pha loãng, nên vector ra vẫn là của đúng người. Cụm chỉ có mảnh ngắn
-    # vẫn phải lấy mẫu: thiếu một mẫu là mất hẳn lớp 3, mà đó đúng là lúc lớp 1
-    # đã lệch và cần lớp 3 kéo về nhất.
+    # Enrollment sample: the LONGEST piece of each cluster. A long piece dilutes
+    # whatever leaked in from the other voice, so the vector still belongs to
+    # the right person. A cluster with only short pieces still needs a sample:
+    # missing one turns layer 3 off entirely, and that is exactly the case where
+    # layer 1 went wrong and layer 3 is needed most.
     profiles: dict[int, object] = {}
     for cluster in {piece[2] for piece in pieces}:
         pool = [piece for piece in pieces if piece[2] == cluster]
@@ -268,17 +302,60 @@ def _label(
             scores = {key: float(np.dot(vector, profile)) for key, profile in profiles.items()}
             winner = max(scores, key=lambda key: scores[key])
             margin = round(abs(scores[winner] - min(scores.values())), 4)
-            # Vân giọng chỉ được lật nhãn khi nó CHẮC. Sát nhau thì giữ nhãn của
-            # lớp phân cụm: đổi nhãn bằng một con số 0,02 là tung đồng xu rồi
-            # gọi đó là kết quả đo.
+            # Embeddings may only flip a label when they are CERTAIN. When the
+            # scores sit close together, keep the clustering layer's label:
+            # flipping on a margin of 0.02 is a coin toss reported as a
+            # measurement.
             if margin >= MIN_COSINE_MARGIN:
                 speaker = "agent" if winner == agent_cluster else "caller"
         labels.append(Labelled(start, end, speaker, margin))
     return labels, reason
 
 
+def _role_profiles(
+    splitter: MonoSpeakerSplitter, samples, labels: list[Labelled]
+) -> dict[str, object] | None:
+    """One voice embedding per ROLE, taken from that role's longest turn.
+
+    Used to name the separated streams. A long turn dilutes whatever leaked in
+    from the other voice. Returns ``None`` when either role has no usable
+    sample: naming two streams from one embedding is naming them by feel.
+    """
+    profiles: dict[str, object] = {}
+    for role in ("caller", "agent"):
+        mine = [label for label in labels if label.speaker == role]
+        if not mine:
+            return None
+        longest = max(mine, key=lambda label: label.end_ms - label.start_ms)
+        if longest.end_ms - longest.start_ms < MIN_SAMPLE_MS:
+            return None
+        profiles[role] = splitter.embed(samples[longest.start_ms * 16 : longest.end_ms * 16])
+    return profiles
+
+
+def _transcribe_track(transcriber: Transcriber, track, work: Path) -> str:
+    """Read words off a separated stream - words only, never timestamps.
+
+    A separated stream's clock starts at the padded window edge, so its
+    timestamps do not belong on the call's timeline.
+
+    VAD is off here: the clip is short and already known to contain speech,
+    while VAD on a short clip tends to clip the first word.
+    """
+    import numpy as np
+
+    clip = work / "overlap_clip.wav"
+    with wave.open(str(clip), "wb") as dest:
+        dest.setnchannels(1)
+        dest.setsampwidth(2)
+        dest.setframerate(audio.TARGET_SAMPLE_RATE)
+        dest.writeframes((np.clip(track, -1.0, 1.0) * 32767).astype("int16").tobytes())
+    return " ".join(word.text for word in transcriber.words(clip, vad_filter=False)).strip()
+
+
 __all__ = [
     "ERRORS",
+    "MIN_SEPARATE_MS",
     "MonoSplitUnavailable",
     "Result",
     "SeparationError",

@@ -1,8 +1,8 @@
-"""Tải hai mô hình ONNX về máy, một lần.
+"""Download the two ONNX models once.
 
-Cả hai đều nhỏ và chạy trên CPU: segmentation 6 MB, vân giọng 38 MB. Không có
-PyTorch trong đường chạy — đó là lý do dự án này cài được trong một phút và
-chạy được trên máy không GPU.
+Both are small and run on CPU: segmentation 6 MB, voice embedding 38 MB. No
+PyTorch anywhere in the path - that is why this project installs in a minute
+and runs on a machine without a GPU.
 """
 
 from __future__ import annotations
@@ -21,23 +21,24 @@ EMBEDDING_URL = (
 
 
 def models_dir() -> Path:
-    """Nơi để mô hình. Đổi được bằng ``MONOSPLIT_MODELS``."""
+    """Where the models live. Override with ``MONOSPLIT_MODELS``."""
     return Path(os.environ.get("MONOSPLIT_MODELS", Path.home() / ".cache" / "monosplit"))
 
 
 def ensure_models(directory: Path | None = None) -> tuple[Path, Path]:
-    """Trả về (segmentation, embedding); tải về nếu chưa có."""
+    """Return (segmentation, embedding); download whichever is missing."""
     target = directory or models_dir()
     target.mkdir(parents=True, exist_ok=True)
     seg, emb = target / "seg.onnx", target / "emb.onnx"
     for path, url in ((seg, SEGMENTATION_URL), (emb, EMBEDDING_URL)):
         if path.exists() and path.stat().st_size > 0:
             continue
-        print(f"tải {path.name} …")
-        # Tải ra tệp tạm rồi mới đổi tên: một lần Ctrl-C giữa chừng không để
-        # lại tệp cụt mà lần chạy sau tưởng là tải xong.
+        print(f"downloading {path.name} ...")
+        # Download to a temp name and rename afterwards: one Ctrl-C halfway
+        # through must not leave a truncated file that the next run mistakes
+        # for a finished download.
         partial = path.with_suffix(".part")
-        urllib.request.urlopen  # noqa: B018 - giữ tên cho dễ đọc stack trace
+        urllib.request.urlopen  # noqa: B018 - keeps the name readable in stack traces
         with urllib.request.urlopen(url) as response, partial.open("wb") as out:  # noqa: S310
             while chunk := response.read(1 << 20):
                 out.write(chunk)

@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="vi">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=1280">
-<title>monosplit — tách khách / agent</title>
+<title>monosplit — split caller / agent</title>
 <style>
   :root {
     --khach: #2563eb;
@@ -70,25 +70,25 @@
 <body>
 <main>
   <h1>monosplit</h1>
-  <p class="phu">Tách giọng khách và agent khỏi bản ghi cuộc gọi một kênh.</p>
+  <p class="phu">Split the caller and agent voices out of a single-channel call recording.</p>
 
   <section>
     <div id="tha">
-      Kéo tệp ghi âm thả vào đây, hoặc bấm để chọn tệp<br>
+      Drag a recording here, or click to pick a file<br>
       <span id="ten"></span>
     </div>
     <input id="chon" type="file" accept="audio/*,.m4a,.wav,.mp3,.ogg" hidden>
-    <textarea id="yeu-cau" placeholder="Tuỳ chọn — mỗi dòng một việc agent phải làm (giúp chọn đúng vai). Ví dụ: chào và xưng tên tổng đài"></textarea>
+    <textarea id="yeu-cau" placeholder="Optional — one line per task the agent must do (helps pick the right role). Example: greet and state the hotline name"></textarea>
     <div class="hang">
-      <button id="chay" disabled>Tách giọng</button>
+      <button id="chay" disabled>Split voices</button>
       <span id="trang-thai"></span>
     </div>
   </section>
 
   <div id="ket-qua" class="an">
     <section>
-      <h2>Dòng thời gian</h2>
-      <div class="lan-ten" style="color:var(--khach)">Khách</div>
+      <h2>Timeline</h2>
+      <div class="lan-ten" style="color:var(--khach)">Caller</div>
       <div class="lan" id="lan-caller"></div>
       <div class="lan-ten" style="color:var(--agent)">Agent</div>
       <div class="lan" id="lan-agent"></div>
@@ -96,25 +96,25 @@
     </section>
 
     <section>
-      <h2>Dạng sóng</h2>
+      <h2>Waveform</h2>
       <canvas id="song" height="180"></canvas>
     </section>
 
     <section>
-      <h2>Căn cứ &amp; cảnh báo</h2>
+      <h2>Evidence &amp; warnings</h2>
       <dl>
-        <dt>Nguồn</dt><dd id="nguon"></dd>
-        <dt>Đường chạy</dt><dd id="mode"></dd>
-        <dt>Chọn vai</dt><dd id="ly-do"></dd>
+        <dt>Source</dt><dd id="nguon"></dd>
+        <dt>Route</dt><dd id="mode"></dd>
+        <dt>Role choice</dt><dd id="ly-do"></dd>
       </dl>
       <div id="canh-bao"></div>
     </section>
 
     <section>
-      <h2>Bảng lượt nói</h2>
+      <h2>Turn table</h2>
       <table>
         <thead><tr>
-          <th>STT</th><th>Vai</th><th>Bắt đầu</th><th>Kết thúc</th><th>Độ dài</th><th>Margin</th><th>Lời</th>
+          <th>#</th><th>Role</th><th>Start</th><th>End</th><th>Length</th><th>Margin</th><th>Text</th>
         </tr></thead>
         <tbody id="bang"></tbody>
       </table>
@@ -124,12 +124,12 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const VAI = { caller: "Khách", agent: "Agent" };
+const VAI = { caller: "Caller", agent: "Agent" };
 let tep = null;
 
 const dongHo = (ms) => `${Math.floor(ms / 60000)}:${String(Math.floor((ms % 60000) / 1000)).padStart(2, "0")}.${String(Math.floor(ms % 1000 / 100))}`;
 
-// --- chọn tệp: kéo-thả và bấm đều về cùng một chỗ ---
+// --- file pick: drag-and-drop and click both land in the same place ---
 const tha = $("tha");
 tha.onclick = () => $("chon").click();
 $("chon").onchange = (e) => nhan(e.target.files[0]);
@@ -145,13 +145,13 @@ function nhan(f) {
   $("trang-thai").textContent = "";
 }
 
-// --- gọi API ---
+// --- call the API ---
 $("chay").onclick = async () => {
   if (!tep) return;
   $("chay").disabled = true;
   const tt = $("trang-thai");
   tt.className = "";
-  tt.textContent = "Đang tách giọng và chép lời, có thể mất một lúc…";
+  tt.textContent = "Splitting voices and transcribing, this may take a while…";
   const form = new FormData();
   form.append("file", tep);
   form.append("requirements", $("yeu-cau").value);
@@ -163,40 +163,41 @@ $("chay").onclick = async () => {
       throw new Error(chi.message || JSON.stringify(chi));
     }
     ve(data);
-    tt.textContent = `Xong — ${data.turns.length} lượt nói.`;
+    tt.textContent = `Done — ${data.turns.length} turns.`;
   } catch (err) {
     tt.className = "loi";
-    tt.textContent = `Lỗi: ${err.message}`;
+    tt.textContent = `Error: ${err.message}`;
   } finally {
     $("chay").disabled = false;
   }
 };
 
-// --- vẽ kết quả ---
+// --- render the result ---
 function ve(d) {
-  // Bỏ lớp ẩn TRƯỚC khi vẽ: canvas trong khối display:none có bề rộng 0 nên
-  // dạng sóng sẽ ra trắng trơn.
+  // Drop the hidden class BEFORE drawing: a canvas inside a display:none block
+  // has zero width, so the waveform would come out blank.
   $("ket-qua").classList.remove("an");
   const tong = Math.max(d.duration_ms, ...d.turns.map((t) => t.end_ms), 1);
   $("het").textContent = dongHo(tong);
-  $("nguon").textContent = `${d.source} — ${(d.duration_ms / 1000).toFixed(1)}s, ${d.channels} kênh`;
+  $("nguon").textContent = `${d.source} — ${(d.duration_ms / 1000).toFixed(1)}s, ${d.channels} channels`;
   $("mode").textContent = d.mode;
   $("ly-do").textContent = d.role_reason || "—";
 
   const cb = $("canh-bao");
   cb.innerHTML = "";
   const canh = [...(d.warnings || [])];
-  // pipeline đã tự thêm cảnh báo "một giọng" — chỉ nói thêm khi nó vắng mặt,
-  // hai dòng giống nhau chỉ làm người đọc phân vân.
-  if (d.same_voice && !canh.some((c) => c.includes("một giọng"))) {
-    canh.push("Hai bên nghe như một giọng — nhãn gán luân phiên theo lượt, hãy kiểm lại bằng tai.");
+  // the pipeline already adds its own "one voice" warning — only add ours when
+  // that one is absent, two near-identical lines just leave the reader guessing.
+  if (d.same_voice && !canh.some((c) => c.includes("one voice"))) {
+    canh.push("Both sides sound like one voice — labels are assigned alternately per turn, verify by ear.");
   }
-  // Nghi có overlap: nói SỐ LẦN và MỐC, không cộng thành tổng số giây — biên
-  // của mô hình nhoè ±62 ms nên một con số tổng trông chính xác hơn sự thật.
-  const VAI_VN = { caller: "Khách", agent: "Agent" };
+  // Suspected overlap: report the COUNT and the TIMESTAMPS, do not sum them into
+  // a total in seconds — the model's boundaries are fuzzy to ±62 ms, so a total
+  // looks more precise than the truth.
+  const VAI_VN = { caller: "Caller", agent: "Agent" };
   for (const o of d.overlaps || []) {
-    const huong = VAI_VN[o.who_cut_in] ? ` — ${VAI_VN[o.who_cut_in]} chen vào` : "";
-    canh.push(`Nghi có overlap tại ${(o.start_ms / 1000).toFixed(1)}s${huong} (phỏng đoán, không phải phép đo).`);
+    const huong = VAI_VN[o.who_cut_in] ? ` — ${VAI_VN[o.who_cut_in]} cut in` : "";
+    canh.push(`Suspected overlap at ${(o.start_ms / 1000).toFixed(1)}s${huong} (inferred, not measured).`);
   }
   for (const c of canh) {
     const div = document.createElement("div");
@@ -214,7 +215,7 @@ function ve(d) {
     khoi.className = `khoi ${t.speaker}`;
     khoi.style.left = `${(t.start_ms / tong) * 100}%`;
     khoi.style.width = `${Math.max((t.duration_ms / tong) * 100, 0.3)}%`;
-    khoi.title = `${VAI[t.speaker]} ${dongHo(t.start_ms)}–${dongHo(t.end_ms)}\n${t.text || "(không có lời)"}`;
+    khoi.title = `${VAI[t.speaker]} ${dongHo(t.start_ms)}–${dongHo(t.end_ms)}\n${t.text || "(no text)"}`;
     khoi.textContent = t.text || String(i + 1);
     $(`lan-${t.speaker}`).appendChild(khoi);
 
@@ -247,15 +248,15 @@ function ve(d) {
 function veSong(d) {
   const cv = $("song");
   const w = cv.clientWidth, h = 180;
-  cv.width = w * 2; // vẽ ở độ phân giải gấp đôi cho nét trên màn hình HiDPI
+  cv.width = w * 2; // draw at double resolution so it stays crisp on HiDPI screens
   cv.height = h;
   const ctx = cv.getContext("2d");
   ctx.clearRect(0, 0, cv.width, h);
   const song = d.waveform || [];
   if (!song.length) return;
 
-  // Mỗi cột màn hình gộp nhiều khung: lấy đỉnh, không lấy trung bình, để một
-  // tiếng ngắn không bị san phẳng mất.
+  // Each screen column merges several frames: take the peak, not the average, so
+  // a short sound is not flattened away.
   const cot = cv.width;
   const buoc = song.length / cot;
   const khung = d.waveform_frame_ms || 20;

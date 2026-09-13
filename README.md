@@ -1,87 +1,91 @@
 # monosplit
 
-**Tách giọng khách và giọng agent ra khỏi một bản ghi cuộc gọi MỘT kênh.** Chạy trên CPU, không
-PyTorch, hai mô hình ONNX cộng lại 44 MB.
+**Split the caller's voice from the agent's voice in a SINGLE-channel call recording.** Runs on
+CPU, no PyTorch, two ONNX models totalling 44 MB.
 
-## Vấn đề
+## The problem
 
-Bản ghi hai kênh thì không có gì phải làm: kênh nào là ai do người dùng khai. Bản ghi một kênh —
-khách bấm ghi âm trên điện thoại trong xe, tổng đài xuất mono — thì cả hai người nằm chung một
-luồng sóng âm, và mọi thứ về sau (đo thời gian đáp, chấm điểm agent, gỡ băng) đều phải bắt đầu
-bằng một câu suy đoán: *câu này ai nói?* Suy sai là chấm oan agent bằng chính lời của khách.
+A two-channel recording needs no work: which channel is who is declared by the user. A
+single-channel recording — the caller hitting record on a phone in the car, the call centre
+exporting mono — puts both people in one waveform, and everything downstream (response-time
+measurement, agent scoring, transcription) has to start with a guess: *who said this?* Guessing
+wrong means blaming the agent for the caller's own words.
 
-Tệp ghi "stereo" **không** đảm bảo điều đó đã được giải quyết. Rất nhiều bản ghi hai kênh thật ra
-là mono nhân đôi (hai kênh giống nhau từng mẫu), hoặc thu một bên còn bên kia câm. Tin vào số kênh
-trong metadata và đi đường hai kênh với những tệp đó thì mỗi câu bị phiên âm hai lần rồi gán cho
-cả hai vai với **cùng một mốc thời gian** — một bản gỡ băng nhìn thì đầy đủ mà vô nghĩa. `monosplit`
-đo chênh lệch biên độ giữa hai kênh trước, rồi mới quyết đi đường nào; gặp bản ghi hai kênh thật
-thì nó dừng và bảo bạn dùng thẳng từng kênh chứ không đoán.
+A file marked "stereo" is **no** guarantee that this has already been solved. Plenty of real
+two-channel recordings are duplicated mono (both channels identical sample for sample), or one
+side recorded while the other is silent. Trusting the channel count in the metadata and taking the
+two-channel path with those files means every utterance is transcribed twice and assigned to both
+roles with **the same timestamps** — a transcript that looks complete and means nothing.
+`monosplit` measures the amplitude difference between the two channels first, and only then decides
+which path to take; on a genuine two-channel recording it stops and tells you to use each channel
+directly instead of guessing.
 
-## Đường chạy
+## The pipeline
 
-![Ba lớp tách khách / agent trên bản ghi một kênh](docs/kien-truc.png)
+![Three layers that split caller / agent on a single-channel recording](docs/architecture.png)
 
 <details>
-<summary>Cùng sơ đồ, dạng mermaid (dễ sửa trong repo; ảnh PNG ở trên rõ hơn nên để làm hình chính)</summary>
+<summary>Same diagram in mermaid (easier to edit in the repo; the PNG above is sharper, so it stays the main figure)</summary>
 
 ```mermaid
 flowchart LR
-    F[Tệp ghi âm một kênh<br/>wav · m4a · mp3] --> P[probe + one_stream_only<br/>2 kênh thật → dừng]
-    P --> V[VAD: quãng có tiếng<br/>khung 20 ms · ≥ 200 ms]
-    V --> L1[Lớp 1 — phân cụm mù<br/>pyannote segmentation 3.0]
-    V -.-> A[Chép lời tuỳ chọn<br/>faster-whisper · mốc từ]
-    L1 --> L2[Lớp 2 — chọn vai bằng LỜI<br/>giá trị đọc lại · câu tổng đài]
+    F[Single-channel recording<br/>wav · m4a · mp3] --> P[probe + one_stream_only<br/>true 2 channels → stop]
+    P --> V[VAD: speech runs<br/>20 ms frames · ≥ 200 ms]
+    V --> L1[Layer 1 — blind clustering<br/>pyannote segmentation 3.0]
+    V -.-> A[Optional transcription<br/>faster-whisper · word times]
+    L1 --> L2[Layer 2 — pick the role by TEXT<br/>read-back value · call-centre phrases]
     A -.-> L2
-    L2 --> L3[Lớp 3 — vân giọng chấm lại<br/>ERes2Net · cosine]
-    L3 --> R[Lượt nói có nhãn vai<br/>caller / agent · margin]
+    L2 --> L3[Layer 3 — voice embedding rescore<br/>ERes2Net · cosine]
+    L3 --> R[Turns with role labels<br/>caller / agent · margin]
 ```
 
 </details>
 
-## Ba lớp
+## The three layers
 
-| Lớp | Làm gì | Mô hình | Cái nó KHÔNG làm được |
+| Layer | What it does | Model | What it CANNOT do |
 |---|---|---|---|
-| **1. Phân cụm mù** | Chia bản ghi thành hai cụm giọng, biết *có hai người* và *đổi người lúc nào* | pyannote segmentation 3.0 + ERes2Net, qua `sherpa-onnx` (ONNX) | Không biết cụm nào là ai. Hay nuốt một lượt ngắn ("dạ", "ừ") vào lượt dài bên cạnh |
-| **2. Chọn vai bằng LỜI** | Quyết cụm nào là agent: bên đọc lại giá trị cần xác nhận, bên nói câu của tổng đài | Không mô hình — luật trên chữ của bước ASR | Không cài `faster-whisper` thì lớp này mất căn cứ, phải rơi về đoán theo lượt cuối. Đây là chỗ **duy nhất** quyết ai là ai |
-| **3. Vân giọng chấm lại** | Lấy đoạn dài nhất mỗi cụm làm mẫu, so cosine từng quãng VAD, kéo về đúng bên những lượt lớp 1 đã nuốt | ERes2Net (3D-Speaker), lối rút gọn của Target-Speaker VAD | Hai giọng quá giống nhau (cosine cách nhau < 0,10) thì không dám sửa: giữ nhãn lớp 1 và hạ độ tin cậy |
+| **1. Blind clustering** | Splits the recording into two voice clusters, knows *there are two people* and *when the speaker changes* | pyannote segmentation 3.0 + ERes2Net, via `sherpa-onnx` (ONNX) | Does not know which cluster is who. Tends to swallow a short turn ("yes", "mhm") into the long turn next to it |
+| **2. Pick the role by TEXT** | Decides which cluster is the agent: the side that reads back the value to be confirmed, the side that speaks the call-centre lines | No model — rules over the text from the ASR step | Without `faster-whisper` this layer has no evidence and must fall back to guessing from who spoke last. This is the **only** place where who-is-who is decided |
+| **3. Voice embedding rescore** | Takes the longest piece of each cluster as an enrollment sample, compares the cosine of every VAD run, and pulls back to the right side the turns layer 1 swallowed | ERes2Net (3D-Speaker), a shortcut version of Target-Speaker VAD | When two voices are too similar (cosine less than 0.10 apart) it will not dare to correct: it keeps the layer-1 label and lowers confidence |
 
-## Cài đặt
+## Installation
 
-Cần `ffmpeg` trong `PATH` (giải mã mọi định dạng về PCM 16 kHz).
+Needs `ffmpeg` on `PATH` (decodes any format down to 16 kHz PCM).
 
 ```bash
 git clone https://github.com/kagamikuro1024/mono-speaker-split
 cd mono-speaker-split
-uv sync --extra asr --extra web          # hoặc: pip install -e ".[asr,web]"
+uv sync --extra asr --extra web          # or: pip install -e ".[asr,web]"
 ```
 
-Bỏ `--extra asr` thì vẫn tách được vai, chỉ là lượt không có chữ và lớp 2 mất căn cứ.
-Bỏ `--extra web` nếu không cần giao diện.
+Drop `--extra asr` and roles are still split, only the turns carry no text and layer 2 loses its
+evidence. Drop `--extra web` if you do not need the interface.
 
-Hai mô hình ONNX tự tải lần chạy đầu về `~/.cache/monosplit` (segmentation 6 MB, vân giọng 38 MB).
-Đã có sẵn ở chỗ khác thì trỏ vào đó:
+The two ONNX models download themselves on the first run into `~/.cache/monosplit` (segmentation
+6 MB, voice embedding 38 MB). If you already have them elsewhere, point at that directory:
 
 ```bash
-export MONOSPLIT_MODELS=~/.cache/voice-diar   # thư mục chứa seg.onnx và emb.onnx
+export MONOSPLIT_MODELS=~/.cache/voice-diar   # directory holding seg.onnx and emb.onnx
 ```
 
-## Dùng
+## Usage
 
-### Dòng lệnh
+### Command line
 
 ```bash
-monosplit cuoc-goi.wav                                   # in bảng lượt nói
-monosplit cuoc-goi.wav --json                            # in Result.to_dict()
-monosplit cuoc-goi.wav --no-asr                          # bỏ bước chép lời
-monosplit cuoc-goi.wav --models ~/.cache/voice-diar      # dùng mô hình có sẵn
-monosplit cuoc-goi.wav --requirement "biển số xe"        # giá trị agent phải đọc lại
+monosplit cuoc-goi.wav                                   # print the turn table
+monosplit cuoc-goi.wav --json                            # print Result.to_dict()
+monosplit cuoc-goi.wav --no-asr                          # skip transcription
+monosplit cuoc-goi.wav --models ~/.cache/voice-diar      # use models you already have
+monosplit cuoc-goi.wav --requirement "license plate"     # value the agent must read back
+monosplit cuoc-goi.wav --separator sepformer16k.onnx     # also recover the words inside overlaps
 ```
 
-`--requirement` là căn cứ mạnh nhất của lớp 2: khai giá trị mà agent buộc phải nhắc lại để xác
-nhận thì việc chọn vai không còn phải dựa vào câu cửa miệng.
+`--requirement` is layer 2's strongest evidence: declare the value the agent is obliged to repeat
+for confirmation and picking the role no longer depends on stock phrases.
 
-### Thư viện
+### Library
 
 ```python
 from pathlib import Path
@@ -92,169 +96,253 @@ result = separate(Path("cuoc-goi.wav"), MonoSpeakerSplitter(str(seg), str(emb)))
 for turn in result.turns:
     print(f"{turn.start_ms:>7} {turn.speaker:<6} {turn.text}")
 
-for span in result.overlaps:          # nghi hai bên cùng nói — phỏng đoán
-    print(f"{span['start_ms']:>7} {span['who_cut_in']} chen vào")
+for span in result.overlaps:          # suspected both talking at once — inferred
+    print(f"{span['start_ms']:>7} {span['who_cut_in']} cut in")
+    for line in span["recovered"] or []:   # words separated out of the overlap
+        print(f"          recovered [{line['role'] or 'unknown'}]: {line['text']}")
 ```
 
-`separate` nhận thêm `transcriber=Transcriber("small")` để có chữ, và `requirements=[...]` như
-`--requirement`. Không tách được thì nó ném `SeparationError` với `code` là
-`khong_co_tieng_noi`, `khong_tach_nguoi_noi` hoặc `hai_kenh_that` — mã để phía gọi hiện đúng câu,
-chứ không phải một kết quả rỗng trông như đã chạy xong.
+`separate` also takes `transcriber=Transcriber("small")` for text, `requirements=[...]` like
+`--requirement`, and `voice_separator=VoiceSeparator("sepformer16k.onnx")` to fill in `recovered`.
+When it cannot split, it raises `SeparationError` with a `code` of
+`khong_co_tieng_noi`, `khong_tach_nguoi_noi` or `hai_kenh_that` — a code so the caller can show the
+right message, instead of an empty result that looks like a completed run.
 
-### Giao diện web
+### Web interface
 
 ```bash
-uvicorn monosplit.web:app          # mở http://127.0.0.1:8000
+uvicorn monosplit.web:app          # open http://127.0.0.1:8000
 ```
 
-Kéo tệp vào trang để xem dạng sóng và các lượt đã gán vai. API: `POST /api/separate`
-(multipart `file`, tuỳ chọn `requirements`) trả về `Result.to_dict()` kèm `waveform`.
+Drag a file onto the page to see the waveform and the role-labelled turns. API:
+`POST /api/separate` (multipart `file`, optional `requirements`) returns `Result.to_dict()` along
+with `waveform`.
 
-## Điều dự án này KHÔNG làm
+## What this project does NOT do
 
-- **Không đo được tổng số giây overlap.** Hai người cùng nói trên một kênh thì chỉ còn một
-  luồng sóng âm — không tách lại được. *Phát hiện* có overlap thì làm được (xem mục dưới), còn
-  cộng thành tổng thời lượng thì không: chỗ này phải báo "chưa đo được", không được báo 0.
-- **Nhãn là suy đoán, không phải sự thật.** Mọi `Result` mang theo `role_reason` (lớp 2 đã chọn
-  bằng căn cứ nào) và `margin` từng lượt. Căn cứ yếu nhất — "đoán theo bên nói lượt cuối" — được
-  nói thẳng ra để bạn soát lại, chứ không ẩn đi cho kết quả trông chắc chắn.
-- **Hai giọng giống nhau thì chỉ còn thứ tự lượt.** Bản ghi tổng hợp hay dùng cùng một giọng TTS
-  cho cả hai vai; vân giọng khi đó vô dụng. `monosplit` gán nhãn luân phiên theo lượt, đặt
-  `same_voice=True` và thêm cảnh báo — và chỉ làm vậy khi chính lời nói cho thấy có hai vai, vì
-  "một giọng" cũng đúng với bản ghi chỉ có một người nói.
-- **Không nhận diện người nói cụ thể.** Không có cơ sở dữ liệu giọng, không biết agent nào đang
-  nói. Giọng agent đổi theo cấu hình của từng người dùng nên không ghim được.
-- **Không phải bộ gỡ băng.** Chép lời là nhánh tuỳ chọn, có mặt để lớp 2 có chữ mà chọn vai.
+- **Cannot measure total overlap seconds.** Two people speaking at once on one channel leave a
+  single waveform — it cannot be pulled apart again. *Detecting* that there is overlap is doable
+  (see the section below), but adding it up into a total duration is not: here it must report "not
+  measurable", never 0.
+- **Labels are inferred, not ground truth.** Every `Result` carries `role_reason` (which evidence
+  layer 2 used to choose) and a per-turn `margin`. The weakest evidence — "guessed from whoever
+  spoke last" — is stated outright so you can check it, not hidden to make the result look certain.
+- **When the two voices are identical, only turn order is left.** Synthetic recordings often use
+  the same TTS voice for both roles; voice embeddings are useless there. `monosplit` alternates
+  labels turn by turn, sets `same_voice=True` and adds a warning — and does so only when the speech
+  itself shows there are two roles, because "one voice" is also true of a recording with only one
+  speaker.
+- **Does not identify specific speakers.** There is no voice database, no knowing which agent is
+  speaking. Agent voices change per user configuration, so they cannot be pinned down.
+- **Not a transcription tool.** Transcription is an optional branch, present so layer 2 has text to
+  pick the role with.
 
-## Phát hiện overlap: đo được, nhưng chỉ là phỏng đoán
+## Overlap detection: measurable, but only inferred
 
-Mô hình phân đoạn mà lớp 1 đang dùng là **powerset 7 lớp** — đọc thẳng từ metadata của
-`seg.onnx`:
+The segmentation model layer 1 uses is a **7-class powerset** — read straight out of the metadata
+of `seg.onnx`:
 
 ```
 num_classes = 7 · num_speakers = 3 · powerset_max_classes = 2
-receptive_field_shift = 270   → 16,875 ms mỗi frame
+receptive_field_shift = 270   → 16.875 ms per frame
 ```
 
-7 lớp là `{∅, s1, s2, s3, s1s2, s1s3, s2s3}` — **ba lớp cuối là hai người nói cùng lúc**
-([Plaquet & Bredin, arXiv:2310.13025](https://arxiv.org/abs/2310.13025)). Điểm hay: overlap là
-một lớp `argmax` bình thường, không có ngưỡng nào phải tinh chỉnh. `sherpa_onnx.OfflineSpeakerDiarization.process()`
-cũng đã trả về các segment **chồng nhau về thời gian**, nên thông tin có sẵn; chính
-`speakers.py::split_runs()` cắt chúng thành mảnh kề nhau — cần thế để mỗi lượt có đúng một nhãn —
-và đó là chỗ dấu vết "hai người cùng nói" bị xoá.
+The 7 classes are `{∅, s1, s2, s3, s1s2, s1s3, s2s3}` — **the last three are two people speaking at
+once** ([Plaquet & Bredin, arXiv:2310.13025](https://arxiv.org/abs/2310.13025)). The nice part:
+overlap is an ordinary `argmax` class, with no threshold to tune.
+`sherpa_onnx.OfflineSpeakerDiarization.process()` already returns segments that **overlap in time**,
+so the information is there; it is `speakers.py::split_runs()` that cuts them into adjacent pieces —
+necessary so each turn has exactly one label — and that is where the trace of "two people speaking
+at once" gets erased.
 
-### Đo trên bộ có sự thật đi kèm
+### Measured on a set with ground truth
 
-Trộn bản ghi hai kênh thành một kênh rồi bắt mô hình làm việc **chỉ với bản trộn**, so lại với
-sự thật lấy từ hai kênh riêng:
+Mix a two-channel recording down to one channel, make the model work **only with the mixdown**, and
+compare against ground truth taken from the two separate channels:
 
-| Ca | Sự thật (2 kênh) | Mô hình (bản trộn mono) |
+| Case | Ground truth (2 channels) | Model (mono mixdown) |
 |---|---|---|
-| 5 ca không có overlap | 0 s | **0 s — không lần nào báo bừa** |
-| 1 ca chồng 0,7 s | 0,59 s tại 4,49–5,16 s | 0,78 s tại 4,42–5,20 s |
+| 5 cases with no overlap | 0 s | **0 s — never a false alarm** |
+| 1 case with 0.7 s overlap | 0.59 s at 4.49–5.16 s | 0.78 s at 4.42–5.20 s |
 
-Ca có chồng: **recall 1,00** theo frame, precision 0,76, F1 0,86. Mốc bắt đầu lệch **60 ms** so
-với sự thật khai trong manifest, dưới sai số 150 ms của chính bộ mẫu. Hướng chen cũng suy được từ
-chuỗi nhãn: cụm vào sau là người chen, cụm rời khoảng chồng trước là người nhường.
+On the overlapping case: **recall 1.00** by frame, precision 0.76, F1 0.86. The start mark is off by
+**60 ms** from the ground truth declared in the manifest, below the 150 ms error margin of the
+sample set itself. The direction of the barge-in can also be inferred from the label sequence: the
+cluster that enters later is the one cutting in, the cluster that leaves the overlap first is the one
+yielding.
 
-Chi phí: **0,9 giây xử lý mỗi phút audio** trên CPU, không thêm mô hình nào.
+Cost: **0.9 seconds of processing per minute of audio** on CPU, with no extra model.
 
-### Vì sao vẫn không được trình bày như phép đo
+### Why it is still not presented as a measurement
 
-Độ nhạy trên **giọng người thật qua điện thoại** (trộn hai giọng thật từ hai bản ghi tổng đài):
+Sensitivity on **real human voices over the phone** (two real voices mixed from two call-centre
+recordings):
 
-| Chồng thật | Bắt được | Frame recall |
+| Real overlap | Caught | Frame recall |
 |---|---|---|
-| 200 ms × 3 | 2/3 | 0,45 |
-| 400 ms × 3 | 2/3 | 0,67 |
-| 800 ms × 3 | 2/3 | 0,54 |
-| 1500 ms × 3 | **3/3** | 0,69 |
+| 200 ms x 3 | 2/3 | 0.45 |
+| 400 ms x 3 | 2/3 | 0.67 |
+| 800 ms x 3 | 2/3 | 0.54 |
+| 1500 ms x 3 | **3/3** | 0.69 |
 
-Khớp số liệu công bố: F1 của overlapped speech detection tụt từ ~75 trên micro cài đầu (AMI)
-xuống **~60 trên DIHARD III** có miền thoại điện thoại
+This matches the published figures: the F1 of overlapped speech detection drops from ~75 on
+head-mounted microphones (AMI) to **~60 on DIHARD III**, which contains a telephone-speech domain
 ([Bredin & Laurent, Interspeech 2021, Table 2](https://www.isca-archive.org/interspeech_2021/bredin21_interspeech.pdf)).
-Chỗ yếu là recall: backchannel ngắn ("dạ", "ừ" dưới 200 ms) — đúng loại hay gặp nhất ở tổng đài —
-bị bỏ sót nhiều. Thêm nữa biên nhoè **±62 ms** (receptive field 991 mẫu) nên tổng thời lượng
-phình cỡ **1,36 lần**.
+The weak spot is recall: short backchannels ("yes", "mhm" under 200 ms) — exactly the kind most
+common in a call centre — are missed often. On top of that the boundaries are blurred by **±62 ms**
+(receptive field 991 samples), so the total duration inflates by about **1.36x**.
 
-Nên ranh giới là: **có/không có overlap** và **mốc bắt đầu** thì đo được; **tổng số giây** thì
-không. Báo số lần và mốc, đừng cộng thành giây.
+So the line is: **overlap present / absent** and **the start mark** are measurable; **total seconds**
+are not. Report the count and the marks, do not add them up into seconds.
 
-### Đường "tách sóng ra rồi đo": đã cân, và loại
+### The "separate the waveforms, then measure" route: weighed, and rejected
 
-Đo overlap từ hai luồng *tách ra* sinh overlap giả. Đo trên đúng miền này — thoại điện thoại hai
-người, Fisher/CALLHOME, overlap thật 13–14% —
-[Morrone et al. 2024](https://arxiv.org/html/2303.12002v2) cho: separator tốt (SI-SDRi ~22 dB)
-**FA 2,6–4%**, separator rẻ (Conv-TasNet) **FA 31%** — lớn hơn cả lượng cần đo; ngay cả tách
-**hoàn hảo** (oracle) vẫn FA 1,8%. Cộng thêm: không mô hình TSE nào có bản ONNX chính thức, bản
-pretrained dùng ngay của Alibaba là **audio-visual** (cần video khuôn mặt), checkpoint
-MossFormer2 nặng **670 MB** so với 44 MB hiện tại. Đổi như thế để có con số sai 20–40%: không.
+Measuring overlap from two *separated* streams produces phantom overlap. Measured on exactly this
+domain — two-party telephone speech, Fisher/CALLHOME, real overlap 13–14% —
+[Morrone et al. 2024](https://arxiv.org/html/2303.12002v2) gives: a good separator (SI-SDRi ~22 dB)
+**FA 2.6–4%**, a cheap separator (Conv-TasNet) **FA 31%** — larger than the quantity being measured;
+even **perfect** (oracle) separation still gives FA 1.8%. On top of that: no TSE model has an
+official ONNX build, Alibaba's ready-to-use pretrained model is **audio-visual** (needs face video),
+and the MossFormer2 checkpoint weighs **670 MB** against the current 44 MB. Trading that away for a
+number that is 20–40% wrong: no.
 
-### Chữ ở đoạn chồng: mỗi từ thuộc đúng một lượt
+### Text in an overlapping stretch: every word belongs to exactly one turn
 
-Ở đoạn hai người cùng nói, ASR chỉ nghe ra **một** chuỗi từ — nó không biết mình đang nghe hai
-người. Chuỗi đó phải chia cho hai lượt, và cách chia quyết định bản ghi có đọc được hay không.
+In a stretch where two people speak at once, the ASR hears only **one** word sequence — it does not
+know it is hearing two people. That sequence has to be divided between two turns, and how it is
+divided decides whether the transcript is readable.
 
-Cách cũ để mỗi lượt tự nới hai đầu 400 ms rồi quét độc lập, nên từ ở vùng giáp ranh đi vào **cả
-hai** lượt. Không chỉ là chữ lặp: lượt của khách mang theo câu agent vừa đọc lại, và ai đọc bản
-ghi sau đó — người hay mô hình chấm — tin rằng agent đã nhắc lại con số ấy. Bằng chứng cho một
-việc chưa xảy ra.
+The old approach let each turn widen itself by 400 ms on both ends and then scanned independently, so
+a word in the boundary zone went into **both** turns. Not just duplicated text: the caller's turn
+carried the value the agent had just read back, and anyone reading the transcript afterwards — human
+or scoring model — believed the agent had repeated that number. Evidence for something that never
+happened.
 
-`words_per_piece()` gán mỗi từ cho lượt nó **giao nhiều nhất**. Từ không giao lượt nào (mốc ASR
-lệch, hoặc rơi vào khoảng lặng) mới về lượt gần nhất, và chỉ khi còn trong 400 ms — xa hơn thì bỏ,
-vì gán bừa tệ hơn thiếu một từ.
+`words_per_piece()` assigns each word to the turn it **overlaps the most**. A word that overlaps no
+turn (ASR timestamps drifted, or it falls into silence) only then goes to the nearest turn, and only
+if it is within 400 ms — further than that it is dropped, because a careless assignment is worse than
+a missing word.
 
-Điều này **không** dựng lại được phần chữ đã mất. Cụm từ nằm trong đoạn chồng bị cắt làm hai, nửa
-đầu về người này nửa sau về người kia:
+On its own this does **not** reconstruct the text that was lost. A phrase inside the overlapping
+stretch is cut in two, the first half going to one person and the second half to the other:
 
 ```
-caller      0-5262   … nhớ nhắc lại số trước khi bấm gọi nhé. Số 09
-agent    5262-8160   -03456789, tôi gọi Lua Nga.
+caller      0-5262   … remember to read the number back before you dial. Number 09
+agent    5262-8160   -03456789, this is Lua Nga speaking.
 ```
 
-Muốn chữ đủ cho cả hai bên thì phải có hai luồng tiếng, tức phải có bản ghi hai kênh. Chỗ này là
-vật lý, không phải chỗ mã dở.
+Those turns stay exactly as they are. The words can, however, be recovered separately - see the next
+section.
 
-## Ngưỡng quan trọng
+## Recovering the words inside an overlap
 
-Con số nào cũng đo được, và chỗ nào đo trên bộ mẫu thì ghi luôn khoảng đo trong mã nguồn.
+Pass `--separator model.onnx` and every overlap of at least **400 ms** is separated into two streams
+and transcribed one stream at a time, so the words of the swallowed side come back:
 
-| Hằng | Giá trị | Ở đâu | Vì sao con số này |
+```
+Suspected overlap: 2 time(s) (inferred, not measured)
+             1.0s — Caller cut in
+               recovered [agent]:  Vâng, đã hạ điều hòa xuống 18 độ.
+               recovered [caller]: Hạ điều hòa xuống 18 độ giúp tôi.
+```
+
+(Real output on Vietnamese call audio - kept verbatim rather than translated, since translating a
+measurement invents one. The agent line reads "Yes, the air conditioning is down to 18 degrees";
+the caller line, "Turn the air conditioning down to 18 degrees for me".)
+
+Both lines match the ground truth of that file, while the mixture alone had produced
+`độ hứt tuổi.` - phonetic debris, not words - for the agent.
+
+### What it costs, and which model
+
+Measured on a 30-case suite built from two-channel sources, so every case has per-side ground truth;
+scoring is CER against the known words, not SI-SDR:
+
+| Model | Size | CER caller | CER agent | RTF |
+|---|---|---|---|---|
+| mixture, no separation | - | 0.68 | 0.67 | - |
+| SepFormer wsj0-2mix 8 kHz int8 | 28.5 MB | 0.64 | 0.34 | 0.26 |
+| MossFormer2 16 kHz | 639 MB | 0.56 | 0.53 | 6.4 |
+| **SepFormer WHAMR 16 kHz** | 106 MB | **0.33** | **0.33** | 1.2 |
+
+MossFormer2 has the best SI-SDRi of the group and still loses on words - which is the only thing
+being measured here. The 8 kHz model throws away the band ASR needs. Read the delta, not the
+absolute CER: the reference is the whole turn while the scoring window only covers the overlap, so
+text outside the window counts as missing.
+
+`python -m benchmark.overlap` on the same 26 ground-truth cases, all through the shipped code path:
+caller CER **0.65 → 0.36**, agent CER **0.78 → 0.35**, better in **24 of 26** cases - 17/18 of the
+synthetic-overlap group, 6/6 of the level-mismatch group. The one control case that got worse has no
+overlap at all, which is the reason for the 400 ms floor below.
+
+Model used: [`tonythethompson/SepFormer-WhamR16k-ONNX`](https://huggingface.co/tonythethompson/SepFormer-WhamR16k-ONNX),
+an ONNX export of `speechbrain/sepformer-whamr16k`, Apache-2.0. Still no PyTorch in the path.
+
+### Three limits wired into the code
+
+- **Short overlaps are left alone.** LibriCSS ([arXiv:2001.11482](https://arxiv.org/abs/2001.11482))
+  measured 0% overlap and found separation made WER *worse*: 11.8 → 12.7. The suite here agrees: at
+  200 ms, 2 of 6 cases came out worse than not separating. Hence the 400 ms floor.
+- **The output is recovered text, never measured text.** Cascaded separation → ASR fails through
+  *speaker leakage*: one person's words land in the other stream
+  ([arXiv:2608.22196](https://arxiv.org/abs/2608.22196), Interspeech 2026, up to 71–77% WER on AMI),
+  and Whisper can invent whole sentences on short clips
+  ([arXiv:2402.08021](https://arxiv.org/abs/2402.08021)). So it is returned beside the turns, flagged,
+  for a human to confirm by ear - it never merges into the transcript.
+- **A role is assigned only when the embeddings are certain.** The two streams leave the separator
+  unnamed. Enrollment samples of each role decide which is which, scored as a pairing; below a 0.10
+  cosine margin `role` stays `null`. One TTS voice reading both parts lands here by design - an empty
+  label beats a wrong one, because a wrong one blames the wrong side.
+
+Recovering the **full** text of both sides, timestamps included, still requires two audio streams.
+That part is physics. What the separator buys back is the words - as a lead to verify, not as a
+measurement.
+
+## Thresholds that matter
+
+Every number here is measured, and wherever it was measured on the sample set, the measured range is
+written down in the source.
+
+| Constant | Value | Where | Why this number |
 |---|---|---|---|
-| `SAME_STREAM_RATIO` | `0.02` | `audio.py` | Mono nhân đôi lệch 0,000–0,007% biên độ; hai kênh thật lệch 180–196%. 2% nằm giữa và chịu được sai số nén |
-| `SILENT_CHANNEL_RATIO` | `0.01` | `audio.py` | Một kênh nhỏ hơn 1% kênh kia thì nó không mang lời của ai |
-| `VAD_FRAME_MS` / `MIN_SPEECH_MS` | `20` / `200` | `pipeline.py` | Cùng bộ số với đường hai kênh, để hai đường cho ra cùng một dòng thời gian trên cùng một bản ghi |
-| `MIN_PIECE_MS` | `300` | `speakers.py` | Mảnh 120 ms sau khi cắt theo ranh giới cụm không phải một lượt nói, nó là tiếng đệm — nhập lại vào mảnh bên cạnh |
-| `MERGE_GAP_MS` | `400` | `speakers.py` | Hai lượt cùng cụm cách nhau dưới mức này là một lượt |
-| `MIN_ENROLL_MS` | `1000` | `speakers.py` | ERes2Net cần chừng một giây tiếng nói mới ra vector ổn định |
-| `MIN_SAMPLE_MS` | `400` | `speakers.py` | Cụm không có mảnh nào đủ một giây thì vẫn lấy mảnh dài nhất từ mức này lên: mẫu ngắn còn hơn tắt hẳn lớp 3 |
-| `MIN_COSINE_MARGIN` | `0.10` | `speakers.py` | Dưới mức này là hai giọng quá sát (hoặc quãng quá ngắn): giữ nhãn lớp 1, hạ độ tin cậy |
-| `MAX_SAME_VOICE_COSINE` | `0.40` | `speakers.py` | Đo trên bộ nghiệm thu 30 ca: cùng người 0,54–0,74, khác người 0,06–0,27. Lấy 0,40 vào giữa hai khoảng |
-| `MIN_RESCUE_MS` | `180` | `speakers.py` | Lượt hay bị nuốt đúng là "ừ", "dạ" — ngắn hơn mức lấy mẫu bình thường, bỏ nó thì không còn gì để cứu |
-| `MIN_OVERLAP_MS` | `150` | `speakers.py` | Biên của mô hình nhoè ±62 ms, nên quãng overlap ngắn hơn mức này là vụn của chính sai số đó chứ không phải một lần overlap |
+| `SAME_STREAM_RATIO` | `0.02` | `audio.py` | Duplicated mono differs by 0.000–0.007% in amplitude; genuine two-channel differs by 180–196%. 2% sits in between and tolerates compression error |
+| `SILENT_CHANNEL_RATIO` | `0.01` | `audio.py` | A channel smaller than 1% of the other carries nobody's speech |
+| `VAD_FRAME_MS` / `MIN_SPEECH_MS` | `20` / `200` | `pipeline.py` | The same numbers as the two-channel path, so both paths produce the same timeline on the same recording |
+| `MIN_PIECE_MS` | `300` | `speakers.py` | A 120 ms piece left after cutting on cluster boundaries is not a turn, it is filler — merge it back into the neighbouring piece |
+| `MERGE_GAP_MS` | `400` | `speakers.py` | Two turns of the same cluster less than this apart are one turn |
+| `MIN_ENROLL_MS` | `1000` | `speakers.py` | ERes2Net needs about a second of speech to produce a stable vector |
+| `MIN_SAMPLE_MS` | `400` | `speakers.py` | If a cluster has no piece reaching a full second, still take the longest piece from this level up: a short sample beats switching layer 3 off entirely |
+| `MIN_COSINE_MARGIN` | `0.10` | `speakers.py` | Below this the two voices are too close (or the run is too short): keep the layer-1 label, lower the confidence |
+| `MAX_SAME_VOICE_COSINE` | `0.40` | `speakers.py` | Measured on the 30-case acceptance suite: same person 0.54–0.74, different people 0.06–0.27. 0.40 sits between the two ranges |
+| `MIN_RESCUE_MS` | `180` | `speakers.py` | The turns that get swallowed are exactly "mhm", "yes" — shorter than the normal sampling floor, and dropping them leaves nothing to rescue |
+| `MIN_OVERLAP_MS` | `150` | `speakers.py` | The model's boundaries are blurred by ±62 ms, so an overlap run shorter than this is debris of that same error rather than a real overlap |
+| `MIN_SEPARATE_MS` | `400` | `separate_voices.py` | Below this, separating makes the words worse than leaving them: LibriCSS saw WER 11.8 → 12.7 at 0% overlap, and 2 of 6 cases at 200 ms in the suite here came out worse |
+| `PAD_MS` | `1500` | `separate_voices.py` | Context on both sides of the overlap. Cut flush and the separator only ever hears the mixed part and folds both voices into one stream; 1.5 s scored best on the suite |
+| `MIN_ASSIGN_MARGIN` | `0.10` | `separate_voices.py` | Same value as `MIN_COSINE_MARGIN`: two places assigning roles with two different thresholds would report two different answers for one recording |
 
 ## Benchmark
 
-Bộ chạy thật, không mô phỏng: xem [`benchmark/README.md`](benchmark/README.md).
+A suite that runs for real, no simulation: see [`benchmark/README.md`](benchmark/README.md).
 
 ```bash
-python -m benchmark.run --audio /đường/dẫn/tới/bản-ghi   # in bảng markdown + ghi benchmark/report.json
+python -m benchmark.run --audio /path/to/recordings   # prints a markdown table + writes benchmark/report.json
 ```
 
-## Giấy phép
+## Licence
 
-MIT — xem [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE).
 
-## Cảm ơn
+## Thanks
 
-Dự án này chỉ là ba lớp logic đặt lên công trình của người khác:
+This project is just three layers of logic on top of other people's work:
 
-- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — chạy cả hai mô hình trên `onnxruntime`,
-  không cần PyTorch.
-- [pyannote segmentation 3.0](https://huggingface.co/pyannote/segmentation-3.0) — mô hình phân
-  đoạn người nói (bản ONNX của
+- [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) — runs both models on `onnxruntime`, no
+  PyTorch needed.
+- [pyannote segmentation 3.0](https://huggingface.co/pyannote/segmentation-3.0) — the speaker
+  segmentation model (ONNX build by
   [csukuangfj](https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0)).
-- [3D-Speaker](https://github.com/modelscope/3D-Speaker) — vân giọng ERes2Net.
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — chép lời với mốc theo từ.
-- Lớp 3 là lối rút gọn của Target-Speaker VAD,
+- [3D-Speaker](https://github.com/modelscope/3D-Speaker) — the ERes2Net voice embedding.
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — transcription with word-level
+  timestamps.
+- Layer 3 is a shortcut version of Target-Speaker VAD,
   [Medennikov et al. 2020](https://arxiv.org/abs/2005.07272).

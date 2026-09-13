@@ -1,13 +1,14 @@
-"""Chép lời bằng faster-whisper, lấy mốc THEO TỪ.
+"""Transcribe with faster-whisper, taking WORD-level timestamps.
 
-Mốc theo đoạn của Whisper không dùng được để cắt lượt: Whisper cắt theo ngữ
-pháp, không theo lúc người ta ngừng nói. Một bản ghi có agent nói hai lần cách
-nhau 2,5 giây vẫn về đúng MỘT đoạn — lấy đoạn làm lượt thì lượt đó nuốt trọn
-khoảng lặng và độ trễ đáp của lượt sau biến mất. Mốc từng từ thì khoảng cách
-2,4 giây hiện ra rõ ràng.
+Whisper's segment timestamps cannot be used to cut turns: Whisper cuts on
+grammar, not on when people stop speaking. A recording where the agent speaks
+twice 2.5 seconds apart still comes back as ONE segment — take the segment as
+the turn and that turn swallows the whole silence, and the response latency of
+the following turn disappears. With per-word timestamps the 2.4 second gap
+shows up clearly.
 
-Cả module là TUỲ CHỌN: không cài faster-whisper thì đường tách giọng vẫn chạy,
-chỉ là các lượt không có chữ.
+The whole module is OPTIONAL: without faster-whisper installed the speaker
+splitting path still runs, the turns just carry no text.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Any
 
 
 class TranscriberUnavailable(RuntimeError):
-    """Chưa cài faster-whisper."""
+    """faster-whisper is not installed."""
 
 
 @dataclass(frozen=True)
@@ -29,25 +30,30 @@ class Word:
 
 
 class Transcriber:
-    """Bọc faster-whisper. Mô hình nạp một lần, dùng lại cho mọi tệp."""
+    """Wrapper around faster-whisper. Model loaded once, reused for every file."""
 
     def __init__(self, model: str = "small", device: str = "cpu", compute_type: str = "int8") -> None:
         try:
             from faster_whisper import WhisperModel
-        except ImportError as exc:  # pragma: no cover - môi trường thiếu gói
-            raise TranscriberUnavailable("chưa cài faster-whisper") from exc
+        except ImportError as exc:  # pragma: no cover - package missing in the environment
+            raise TranscriberUnavailable("faster-whisper is not installed") from exc
         self._model = WhisperModel(model, device=device, compute_type=compute_type)
 
-    def words(self, path: Path, language: str = "vi") -> list[Word]:
+    def words(self, path: Path, language: str = "vi", vad_filter: bool = True) -> list[Word]:
+        # ``vad_filter=False`` for already separated clips at an overlap: those
+        # clips are short and known to contain speech, and VAD on a short clip
+        # often cuts the first word off — measured on the 30-case suite, turning
+        # VAD off for separated clips gives more accurate text.
         segments, _info = self._model.transcribe(
-            str(path), language=language, word_timestamps=True, vad_filter=True
+            str(path), language=language, word_timestamps=True, vad_filter=vad_filter
         )
         out: list[Word] = []
         for segment in segments:
             words: list[Any] = list(getattr(segment, "words", None) or [])
             if not words:
-                # Đoạn không có mốc từ (Whisper thỉnh thoảng bỏ) vẫn phải giữ:
-                # mất lời còn tệ hơn mốc thô.
+                # A segment with no word timestamps (Whisper drops them now and
+                # then) still has to be kept: losing the text is worse than a
+                # coarse timestamp.
                 text = segment.text.strip()
                 if text:
                     out.append(
@@ -66,16 +72,18 @@ class Transcriber:
 def words_per_piece(
     words: list[Word], pieces: list[tuple[int, int, int]], pad_ms: int = 400
 ) -> list[str]:
-    """Chia chữ cho từng mảnh — mỗi từ thuộc ĐÚNG MỘT mảnh.
+    """Hand out the text per piece — every word belongs to EXACTLY ONE piece.
 
-    Cách cũ (`text_in_range`) để mỗi mảnh tự nới hai đầu ``pad_ms`` rồi quét
-    độc lập, nên một từ ở vùng giáp ranh đi vào CẢ HAI mảnh. Hậu quả không chỉ
-    là chữ lặp: lượt của một bên mang theo câu bên kia vừa nói, và ai đọc bản
-    ghi sau đó tin rằng người này đã nói câu của người kia.
+    The old approach (`text_in_range`) let each piece widen both ends by
+    ``pad_ms`` and then scan independently, so a word near a boundary went into
+    BOTH pieces. The consequence is not just duplicated text: one side's turn
+    carries the sentence the other side just said, and whoever reads the
+    transcript afterwards believes this person spoke the other one's line.
 
-    Luật: từ thuộc mảnh mà nó GIAO nhiều nhất. Từ không giao mảnh nào (mốc ASR
-    lệch, hoặc rơi vào khoảng lặng) mới về mảnh gần nhất, và chỉ khi còn trong
-    ``pad_ms`` — xa hơn thì nó không phải lời của lượt nào cả.
+    Rule: a word belongs to the piece it OVERLAPS most. Only a word that
+    overlaps no piece (ASR timestamp drift, or it falls into silence) goes to
+    the nearest piece, and only while still within ``pad_ms`` — further away
+    than that it is not the speech of any turn.
     """
     buckets: list[list[str]] = [[] for _ in pieces]
     for word in words:
