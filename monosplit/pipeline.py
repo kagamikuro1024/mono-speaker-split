@@ -63,6 +63,13 @@ ERRORS: dict[str, str] = {
 }
 
 
+def _cut_in_direction(cut_in: str | None, yielded: str | None) -> dict[str, str | None]:
+    """The direction, only when the two sides are two DIFFERENT roles."""
+    if cut_in is not None and cut_in == yielded:
+        return {"who_cut_in": None, "who_yielded": None}
+    return {"who_cut_in": cut_in, "who_yielded": yielded}
+
+
 @dataclass
 class Turn:
     """One turn: who spoke, from when to when, what they said, how sure we are."""
@@ -202,8 +209,14 @@ def separate(
             {
                 "start_ms": span["start_ms"],
                 "duration_ms": span["duration_ms"],
-                "who_cut_in": role_of.get(span["cum_chen"]),
-                "who_yielded": role_of.get(span["cum_nhuong"]),
+                # Both clusters mapping to one role makes the direction
+                # meaningless: "caller cut in on caller" is not two people
+                # talking over each other, it is a broken cluster->role mapping.
+                # Keep the timestamp, drop the direction - reading further from
+                # a mapping already known to be wrong is making it up.
+                **_cut_in_direction(
+                    role_of.get(span["cum_chen"]), role_of.get(span["cum_nhuong"])
+                ),
             }
             for span in spans
         ]
@@ -345,19 +358,28 @@ def _recover_overlapping_turns(
     voice_separator,
     work: Path,
 ) -> tuple[list[Turn], list[dict]]:
-    """Re-read every turn that overlaps, off that role's recovery channel.
+    """Re-read the overlapping turns off each role's channel, and rebuild the
+    turns the mixture swallowed whole.
 
-    Turns clear of any overlap keep their text: there the mixture holds one
-    voice only, so it is already the cleanest signal, and sending it through a
-    second model would only add a chance to be wrong.
+    Three things, in order:
 
-    The turn of whoever CUT IN also gets its start pulled back to the start of
-    the overlap. Blind clustering cannot cut inside a stretch where both people
-    speak, so it starts the interrupter's turn AFTER the overlap and their first
-    words get counted into the other person's turn. A two-channel recording of
-    the same call shows the interrupter's turn starting inside the overlap, with
-    the two turns genuinely overlapping in time - which is what talking over
-    each other is.
+    1. **Words.** A turn covering an overlap is re-read off its own role's
+       channel. Turns clear of every overlap keep their text: there the mixture
+       holds one voice only, so it is already the cleanest signal, and sending
+       it through a second model would only add a chance to be wrong.
+    2. **Start time.** The turn of whoever CUT IN gets its start pulled back to
+       the start of the overlap. Blind clustering cannot cut inside a stretch
+       where both people speak, so it starts the interrupter's turn AFTER the
+       overlap and their first words get counted into the other person's turn.
+       Pulled back, the two turns genuinely overlap in time - which is what
+       talking over each other is.
+    3. **Missing turns.** A short turn the other person talks straight THROUGH
+       leaves no silence for the VAD to cut on, so it disappears from the
+       transcript entirely - not wrong words, a lost turn. Measured on a 30 s
+       dense-overlap set: 2 of 11 turns vanished this way. The recovery channel
+       has them separated, so the VAD is run again over exactly the separated
+       windows: a stretch of speech no turn of that role covers becomes a new
+       turn.
     """
     import numpy as np
 
@@ -384,45 +406,97 @@ def _recover_overlapping_turns(
                 continue
             if turn.start_ms > end + TURN_MERGE_GAP_MS:
                 break
+            # Pull back to the overlap's start, but never into the previous turn
+            # of the SAME role: one person cannot speak twice at once, and two
+            # overlapping same-role turns make the word split below hand the
+            # same sentence to both.
+            floor = max(
+                (other.end_ms for other in moved[:index] if other.speaker == role), default=0
+            )
             moved[index] = Turn(
-                turn.speaker, span["start_ms"], turn.end_ms, turn.text, turn.margin
+                turn.speaker, max(span["start_ms"], floor), turn.end_ms, turn.text, turn.margin
             )
             break
 
+    heard: dict[str, list] = {}
     for role, track in tracks.items():
         clip = work / f"recovered_{role}.wav"
+        pcm = (np.clip(track, -1.0, 1.0) * 32767).astype("int16").tobytes()
         with wave.open(str(clip), "wb") as dest:
             dest.setnchannels(1)
             dest.setsampwidth(2)
             dest.setframerate(audio.TARGET_SAMPLE_RATE)
-            dest.writeframes((np.clip(track, -1.0, 1.0) * 32767).astype("int16").tobytes())
-        words = transcriber.words(clip)
-        for index, turn in enumerate(moved):
-            if turn.speaker != role:
-                continue
+            dest.writeframes(pcm)
+        heard[role] = transcriber.words(clip)
+        moved += _turns_missed_on_channel(role, pcm, moved, touched)
+
+    moved.sort(key=lambda turn: (turn.start_ms, turn.speaker))
+
+    for role, words in heard.items():
+        # Split the words between turns of the SAME role exactly the way the
+        # mixture path does: every word goes to exactly ONE turn. The two
+        # recovery channels are independent, so turns of DIFFERENT roles may
+        # still overlap in time - but within one role they may not, and missing
+        # that is three caller turns all carrying one identical sentence.
+        mine = [(index, turn) for index, turn in enumerate(moved) if turn.speaker == role]
+        role_texts = words_per_piece(
+            words, [(turn.start_ms, turn.end_ms, 0) for _index, turn in mine], TURN_MERGE_GAP_MS
+        )
+        for (index, turn), spoken in zip(mine, role_texts, strict=True):
             if not any(
                 turn.start_ms < span["start_ms"] + span["duration_ms"]
                 and span["start_ms"] < turn.end_ms
                 for span in touched
             ):
                 continue
-            # The two recovery channels are independent, so words need no
-            # exclusive assignment the way they do on the mixture: a turn reads
-            # its words off its own role's channel. That is what lets two turns
-            # legitimately overlap in time.
-            spoken = " ".join(
-                word.text
-                for word in words
-                if word.start_ms < turn.end_ms and turn.start_ms <= word.end_ms
-            ).strip()
             # A turn inside an overlap: the recovery channel wins even when it
             # yields less text - the mixture there tends to glue both sides'
             # words into one sentence.
-            if spoken:
+            if spoken.strip():
                 moved[index] = Turn(
                     turn.speaker, turn.start_ms, turn.end_ms, spoken, turn.margin
                 )
-    return moved, marked
+
+    # A turn we invented but read no words on is dropped: an empty line in the
+    # transcript is a line the reviewer has to fill in by hand, which is worse
+    # than no line at all.
+    kept = [turn for turn in moved if turn.text.strip() or turn in turns]
+    return kept, marked
+
+
+def _turns_missed_on_channel(
+    role: str, pcm: bytes, turns: list[Turn], touched: list[dict]
+) -> list[Turn]:
+    """Turns of ``role`` the mixture swallowed, found again on its channel.
+
+    Only inside the separated overlaps: everywhere else the recovery channel IS
+    the mixture, and the clustering layer already split that - accepting runs
+    there would duplicate turns.
+
+    A run the role already has a turn for is skipped. A run merely grazing an
+    existing turn (VAD edges drift) is not a new turn: the bar is overlapping by
+    more than ``MIN_SAMPLE_MS``.
+    """
+    mine = [turn for turn in turns if turn.speaker == role]
+    out: list[Turn] = []
+    for run in speech_energy_runs(pcm, VAD_FRAME_MS, MIN_SPEECH_MS, audio.PCM_BYTES_PER_MS):
+        start, end = run["start_ms"], run["end_ms"]
+        if end - start < MIN_SAMPLE_MS:
+            continue
+        if not any(
+            start < span["start_ms"] + span["duration_ms"] and span["start_ms"] < end
+            for span in touched
+        ):
+            continue
+        covered = max(
+            (min(end, turn.end_ms) - max(start, turn.start_ms) for turn in mine), default=0
+        )
+        if covered > MIN_SAMPLE_MS:
+            continue
+        # margin 0.0: this turn came from the recovery channel, with no two
+        # embeddings to compare - do not invent a confidence for it.
+        out.append(Turn(role, start, end, "", 0.0))
+    return out
 
 
 __all__ = [

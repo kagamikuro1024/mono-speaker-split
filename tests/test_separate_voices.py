@@ -8,6 +8,7 @@ mixture and separated stream crosses over instead of cutting hard.
 
 import numpy as np
 
+from monosplit.pipeline import Turn, _cut_in_direction, _turns_missed_on_channel
 from monosplit.separate_voices import FADE_MS, MIN_SEPARATE_MS, build_role_tracks
 
 CALLER = np.array([1.0, 0.0], dtype="float32")
@@ -161,3 +162,60 @@ def test_a_silent_stream_means_only_one_speaker_was_found() -> None:
     )
 
     assert built is None
+
+
+# ── missing turns and cut-in direction ───────────────────────────────────────
+#
+# Both rules below were found by a 30 s dense-overlap set, not by reading code.
+
+
+def _turn(start: int, end: int, role: str) -> Turn:
+    return Turn(role, start, end, "", 0.5)
+
+
+def _tone(pcm: bytearray, start_ms: int, duration_ms: int) -> None:
+    burst = (np.sin(np.arange(duration_ms * 16) / 4.0) * 12_000).astype("int16").tobytes()
+    pcm[start_ms * 32 : start_ms * 32 + len(burst)] = burst
+
+
+def test_a_turn_talked_straight_through_is_rebuilt_from_its_channel() -> None:
+    """A short turn the other person talks through leaves no silence for the VAD,
+    so it vanishes from the transcript - a lost turn, not wrong words."""
+    pcm = bytearray(30_000 * 32)
+    _tone(pcm, 17_400, 2_100)
+
+    # The caller has one turn elsewhere; the agent speaks across 16.7-19.5 s.
+    turns = [_turn(500, 3_000, "caller"), _turn(16_700, 19_500, "agent")]
+    touched = [{"start_ms": 17_311, "duration_ms": 1_991, "separated": True}]
+
+    found = _turns_missed_on_channel("caller", bytes(pcm), turns, touched)
+
+    assert len(found) == 1
+    assert 17_000 <= found[0].start_ms <= 17_600
+    assert found[0].speaker == "caller"
+    # Nothing was compared to produce this turn, so claim no confidence for it.
+    assert found[0].margin == 0.0
+
+
+def test_a_run_the_role_already_has_a_turn_for_is_not_added_again() -> None:
+    pcm = bytearray(30_000 * 32)
+    _tone(pcm, 17_400, 2_100)
+    touched = [{"start_ms": 17_311, "duration_ms": 1_991, "separated": True}]
+
+    assert _turns_missed_on_channel("caller", bytes(pcm), [_turn(17_356, 19_498, "caller")], touched) == []
+
+
+def test_no_turns_are_added_outside_the_separated_windows() -> None:
+    """Outside an overlap the recovery channel IS the mixture, which the
+    clustering layer already split - accepting runs there duplicates turns."""
+    pcm = bytearray(30_000 * 32)
+    _tone(pcm, 2_000, 2_100)
+    touched = [{"start_ms": 17_311, "duration_ms": 1_991, "separated": True}]
+
+    assert _turns_missed_on_channel("caller", bytes(pcm), [], touched) == []
+
+
+def test_direction_is_dropped_when_both_clusters_map_to_one_role() -> None:
+    assert _cut_in_direction("caller", "caller") == {"who_cut_in": None, "who_yielded": None}
+    assert _cut_in_direction("agent", "caller") == {"who_cut_in": "agent", "who_yielded": "caller"}
+    assert _cut_in_direction(None, "caller") == {"who_cut_in": None, "who_yielded": "caller"}
