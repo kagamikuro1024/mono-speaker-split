@@ -25,7 +25,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 from monosplit import audio
-from monosplit.separate_voices import MIN_SEPARATE_MS, build_role_tracks
+from monosplit.separate_voices import (
+    MIN_SEPARATE_MS,
+    build_role_tracks,
+    continuous_role_tracks,
+)
 from monosplit.speakers import (
     MIN_COSINE_MARGIN,
     MIN_ENROLL_MS,
@@ -46,6 +50,21 @@ from monosplit.transcribe import Transcriber, words_per_piece
 VAD_FRAME_MS = 20
 MIN_SPEECH_MS = 200
 TURN_MERGE_GAP_MS = 400
+
+# Overlapped time divided by total speech time. Above this the recording counts
+# as "densely overlapped": no stretch holds one voice alone to sample from, and
+# the clustering layer has no silence left to cut turns on. Measured on a 30 s
+# dense set (2026-09-13): at 0.56 the normal path collapsed 17 turns into 3,
+# while separating the whole recording kept every sentence on the right side.
+DENSE_OVERLAP_SHARE = 0.30
+
+
+def _overlap_share(overlaps: list[dict], runs: list[dict[str, int]]) -> float:
+    """How much of the speech time is overlapped."""
+    speech = sum(run["end_ms"] - run["start_ms"] for run in runs)
+    if speech <= 0:
+        return 0.0
+    return sum(int(span.get("duration_ms") or 0) for span in overlaps) / speech
 
 
 class SeparationError(RuntimeError):
@@ -170,7 +189,8 @@ def separate(
             raise SeparationError("khong_co_tieng_noi", ERRORS["khong_co_tieng_noi"])
 
         pieces, same_voice, spans = _pieces(splitter, samples, runs)
-        if len(pieces) < 2:
+        can_separate = voice_separator is not None and transcriber is not None
+        if len(pieces) < 2 and not can_separate:
             raise SeparationError("khong_tach_nguoi_noi", ERRORS["khong_tach_nguoi_noi"])
 
         words = transcriber.words(mono_path) if transcriber is not None else []
@@ -178,14 +198,26 @@ def separate(
 
         labels, reason = _label(splitter, samples, pieces, texts, requirements)
         warnings: list[str] = []
-        if same_voice:
+        # Layer 1 gave up: one cluster only, or two clusters that sound like one
+        # voice with no evidence in the words either. On a densely overlapped
+        # recording that is exactly what happens - every piece contains both
+        # people, so every piece resembles every other. A separator turns this
+        # from "refuse" into "separate first, label after", so try that before
+        # giving up.
+        layer_one_failed = len(pieces) < 2 or (
+            same_voice
+            and not co_bang_chung_hai_vai(
+                [(cluster, text) for (_s, _e, cluster), text in zip(pieces, texts, strict=True)],
+                requirements,
+            )
+        )
+        if layer_one_failed and not can_separate:
+            raise SeparationError("khong_tach_nguoi_noi", ERRORS["khong_tach_nguoi_noi"])
+        if same_voice and not layer_one_failed:
             # Synthetic recordings often use ONE voice for both roles: voice
             # embeddings then tell nobody apart. The only real evidence left is
             # TURN ORDER - usable only when the words themselves show two roles,
             # because "one voice" also describes a recording of one person.
-            spoken = [(cluster, text) for (_s, _e, cluster), text in zip(pieces, texts, strict=True)]
-            if not co_bang_chung_hai_vai(spoken, requirements):
-                raise SeparationError("khong_tach_nguoi_noi", ERRORS["khong_tach_nguoi_noi"])
             warnings.append("both sides sound like one voice - labels alternate by turn order")
 
         turns = [
@@ -220,7 +252,34 @@ def separate(
             }
             for span in spans
         ]
-        if voice_separator is not None and transcriber is not None:
+        dense = layer_one_failed or _overlap_share(overlaps, runs) >= DENSE_OVERLAP_SHARE
+        if can_separate and dense:
+            # Overlapped so densely that no stretch holds one voice alone: there
+            # is nothing to sample enrollment from, and the clustering layer has
+            # no silence left to cut turns on either - it merges several turns
+            # into one. Change tack: separate the WHOLE recording into two
+            # channels and read each one like a real second channel.
+            rebuilt = _transcript_from_continuous_split(
+                samples, splitter, transcriber, voice_separator, requirements, work
+            )
+            if rebuilt is not None:
+                turns, reason_suffix = rebuilt
+                reason = f"{reason}; {reason_suffix}"
+                overlaps = [
+                    {**span, "separated": span["duration_ms"] >= MIN_SEPARATE_MS}
+                    for span in overlaps
+                ]
+                dense = False
+            elif layer_one_failed:
+                # Even separating the whole recording did not produce two
+                # people: that is a one-speaker recording, say so.
+                raise SeparationError("khong_tach_nguoi_noi", ERRORS["khong_tach_nguoi_noi"])
+        if (
+            voice_separator is not None
+            and transcriber is not None
+            and not dense
+            and not any(span.get("separated") for span in overlaps)
+        ):
             # The mixture swallowed whoever was quieter, so every turn that
             # overlaps is missing words or carrying the other person's. Rebuild
             # one channel per role and re-read those turns off the channel of
@@ -462,6 +521,82 @@ def _recover_overlapping_turns(
     # than no line at all.
     kept = [turn for turn in moved if turn.text.strip() or turn in turns]
     return kept, marked
+
+
+def _transcript_from_continuous_split(
+    samples,
+    splitter: MonoSpeakerSplitter,
+    transcriber: Transcriber,
+    voice_separator,
+    requirements: list[str],
+    work: Path,
+) -> tuple[list[Turn], str] | None:
+    """Separate the whole recording into two channels and read each one.
+
+    For densely overlapped recordings: there the clustering layer has no silence
+    left to cut turns on, so it merges several turns into one and short turns
+    disappear entirely. Two separated channels hold one voice each, and turn
+    boundaries become measurable again.
+
+    The two channels carry NO role names - the separator only guarantees "two
+    different people". Which one is the caller is still decided by the WORDS
+    (``pick_agent_cluster``), the one place allowed to decide that.
+    """
+    import numpy as np
+
+    built = continuous_role_tracks(samples, separator=voice_separator, embed=splitter.embed)
+    if built is None:
+        return None
+    tracks, stitch = built
+
+    heard: list[tuple[int, int, int, list[str]]] = []
+    for index, track in enumerate(tracks):
+        clip = work / f"continuous_{index}.wav"
+        with wave.open(str(clip), "wb") as dest:
+            dest.setnchannels(1)
+            dest.setsampwidth(2)
+            dest.setframerate(audio.TARGET_SAMPLE_RATE)
+            dest.writeframes((np.clip(track, -1.0, 1.0) * 32767).astype("int16").tobytes())
+        # Turn boundaries come from WORD timestamps, not from a VAD on this
+        # channel: a separated channel still leaks the other voice at a low
+        # level, so a VAD sees speech almost continuously and merges ten seconds
+        # into one turn. Word timestamps show the real pauses.
+        for word in transcriber.words(clip):
+            if heard and heard[-1][0] == index and word.start_ms - heard[-1][2] <= TURN_MERGE_GAP_MS:
+                channel, start, _end, spoken = heard[-1]
+                heard[-1] = (channel, start, word.end_ms, [*spoken, word.text])
+            else:
+                heard.append((index, word.start_ms, word.end_ms, [word.text]))
+    if not heard:
+        return None
+
+    texts = [" ".join(words).strip() for _index, _start, _end, words in heard]
+    agent_channel, reason = pick_agent_cluster(
+        [(item[0], text) for item, text in zip(heard, texts, strict=True)], requirements
+    )
+    order = sorted(range(len(heard)), key=lambda i: heard[i][1])
+    turns = [
+        Turn(
+            "agent" if heard[i][0] == agent_channel else "caller",
+            heard[i][1],
+            heard[i][2],
+            texts[i],
+            # Nothing was compared here: the label comes from the words, and
+            # "two different people" is what the separator guarantees.
+            0.0,
+        )
+        for i in order
+        if texts[i]
+    ]
+    note = (
+        f"densely overlapped, so the whole recording was separated into two channels "
+        f"({stitch['windows']} windows, {stitch['weak_seams']} weak seams); {reason}"
+    )
+    if stitch["weak_seams"]:
+        # A weak seam means the two channels may have swapped there - say so
+        # rather than presenting it as certain.
+        note += " - one join is uncertain, re-check both sides"
+    return turns, note
 
 
 def _turns_missed_on_channel(
