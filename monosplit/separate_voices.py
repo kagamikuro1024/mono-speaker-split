@@ -1,9 +1,16 @@
-"""Recover the WORDS spoken while both people talked at once.
+"""Rebuild one channel per role, so the words of both sides come back.
 
 A single-channel recording carries one waveform, so the quieter speaker is
-swallowed by the mix: running ASR on the mixture returns only the louder side.
-This module separates a window around each overlap into two streams and
-transcribes each one, which brings the missing words back.
+swallowed by the mix: ASR on the mixture returns only the louder side, and the
+turn that overlaps carries either nothing or the other person's words.
+
+What this module builds is a **recovery channel per role**: outside the overlap
+it is the mixture itself (only one person is speaking there, so the mixture is
+already the cleanest signal available), inside the overlap it is that role's
+separated stream. The step that follows then reads those channels exactly the
+way it reads the two channels of a stereo recording - so each turn ends up with
+only the words of the person who spoke it, and the words land straight in the
+transcript for the user to correct.
 
 Three limits are wired into the code, not exposed as options:
 
@@ -11,28 +18,29 @@ Three limits are wired into the code, not exposed as options:
    ([arXiv:2001.11482](https://arxiv.org/abs/2001.11482)) measured 0% overlap
    and found separation made WER *worse*: 11.8 -> 12.7. The 30-case acceptance
    suite in this repo agrees: at 200 ms of overlap, 2 of 6 cases came out worse
-   than not separating at all. Below ``MIN_SEPARATE_MS`` nothing is separated
-   and the result says so instead of guessing.
-2. **What comes out is RECOVERED text, not measured text.** The signature
+   than not separating at all. Below ``MIN_SEPARATE_MS`` nothing is separated.
+2. **The words are still INFERRED, and the result says so.** The signature
    failure of cascaded separation -> ASR is *speaker leakage*: one person's
    words land in the other person's stream
    ([arXiv:2608.22196](https://arxiv.org/abs/2608.22196), Interspeech 2026,
    up to 71-77% WER on AMI). Whisper can also invent whole sentences on short
-   clips ([arXiv:2402.08021](https://arxiv.org/abs/2402.08021)). So this text
-   never merges into the transcript: it is returned separately, flagged, for a
-   human to confirm by ear.
-3. **Roles come from voice embeddings, or stay empty.** The two streams leave
-   the separator unnamed (the permutation problem). Enrollment samples of the
-   two roles decide which is which; when both sides sound like one voice -
-   common in synthetic recordings where a single TTS voice reads both parts -
-   ``role`` stays ``None`` rather than being guessed.
+   clips ([arXiv:2402.08021](https://arxiv.org/abs/2402.08021)). Every overlap
+   that was separated is marked ``separated: True`` so the reader knows which
+   stretch to listen to before trusting it - the whole point of a transcript
+   the user can edit.
+3. **No channels at all rather than guessed roles.** The two streams leave the
+   separator unnamed (the permutation problem). Enrollment samples of the two
+   roles decide which is which, scored as a pairing; below
+   ``MIN_ASSIGN_MARGIN`` nothing is built. One TTS voice reading both parts
+   lands here by design: swapping the channels would swap both sides' words
+   across the whole overlap, which is far worse than leaving the mixture alone.
 
 Measured on the 30-case acceptance suite (2026-09-13, SepFormer WHAMR 16 kHz
 ONNX + Whisper large-v3 on the separated streams):
 
 | Overlap  | CER on caller words | CER on agent words |
 |----------|---------------------|--------------------|
-| mixture  | 0.68                | 0.67               |
+| mixture  | 0.65                | 0.78               |
 | 200 ms   | 0.86 -> 0.37        | 0.63 -> 0.46       |
 | 600 ms   | 0.74 -> 0.27        | 0.83 -> 0.28       |
 | 1200 ms  | 0.59 -> 0.14        | 0.49 -> 0.16       |
@@ -135,117 +143,147 @@ def resample(samples: Any, source_rate: int, target_rate: int) -> Any:
     return np.frombuffer(done.stdout, dtype="int16").astype("float32") / 32768.0
 
 
-def recover_overlap_text(
+# The joint between mixture and separated stream has to cross over gradually. A
+# hard cut produces a click that ASR reads as a stray syllable, and it sits
+# right at the edge of the overlap - the very place the words matter most.
+FADE_MS = 20
+
+
+def build_role_tracks(
     overlaps: list[dict[str, Any]],
     samples: Any,
     *,
     separator: VoiceSeparator,
-    transcribe: Callable[[Any], str],
-    profiles: dict[str, Any] | None = None,
-    embed: Callable[[Any], Any] | None = None,
+    profiles: dict[str, Any],
+    embed: Callable[[Any], Any],
     sample_rate: int = 16_000,
-) -> list[dict[str, Any]]:
-    """Attach ``recovered`` to every overlap long enough to separate.
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Build one recovery channel per role out of a single-channel recording.
+
+    Each channel is as long as the original: the mixture outside every overlap,
+    that role's separated stream inside. The caller can then transcribe the two
+    channels the way it transcribes a stereo pair.
 
     ``samples`` is the mixed waveform as float32 at ``sample_rate`` - the same
     array the labelling layers work on, so overlap timestamps index into it
-    directly with no conversion.
+    directly with no conversion. ``profiles`` holds one voice embedding per role
+    (``caller`` / ``agent``) taken from speech OUTSIDE any overlap.
 
-    ``profiles`` holds one voice embedding per role (``caller`` / ``agent``)
-    taken from speech OUTSIDE any overlap. Without it, or when the two
-    embeddings are too close to separate, the words still come back but
-    ``role`` is left ``None``.
+    Returns ``None`` when nothing was separable, or when the streams could not
+    be assigned to roles - see limit 3 in the module docstring.
 
-    Every returned overlap keeps its original keys. ``recovered is None`` means
-    "could not separate" - a shorter overlap than ``MIN_SEPARATE_MS``, a
-    separator failure, or no speech in either stream - which is not the same as
-    "nobody said anything".
+    The second element is the overlap list with ``separated`` set, so the reader
+    knows which stretches were rebuilt rather than heard directly.
     """
     import numpy as np
 
+    roles = [role for role in ("caller", "agent") if role in profiles]
+    if len(roles) < 2:
+        return None
+
     per_ms = sample_rate // 1000
-    out: list[dict[str, Any]] = []
+    tracks = {role: np.array(samples, dtype="float32", copy=True) for role in roles}
+    marked: list[dict[str, Any]] = []
+    used = 0
     for span in overlaps:
         duration = int(span.get("duration_ms") or 0)
         if duration < MIN_SEPARATE_MS:
-            out.append({**span, "recovered": None})
+            marked.append({**span, "separated": False})
             continue
 
         start = max(0, int(span["start_ms"]) - PAD_MS)
-        end = int(span["start_ms"]) + duration + PAD_MS
+        end = min(len(samples) // per_ms, int(span["start_ms"]) + duration + PAD_MS)
         window = samples[start * per_ms : end * per_ms]
         if len(window) < sample_rate // 2:
-            out.append({**span, "recovered": None})
+            marked.append({**span, "separated": False})
             continue
 
         try:
             streams = separator.streams(resample(window, sample_rate, separator.rate))
         except Exception:  # pragma: no cover - a broken model costs words, not the call
             logger.warning("separation failed at %d ms", span["start_ms"], exc_info=True)
-            out.append({**span, "recovered": None})
+            marked.append({**span, "separated": False})
             continue
 
-        recovered: list[dict[str, Any]] = []
-        for stream in streams:
-            track = resample(stream, separator.rate, sample_rate)
-            peak = float(np.abs(track).max())
-            if peak < SILENT_PEAK:
-                continue
-            text = transcribe(track / peak * 0.9).strip()
-            if not text:
-                continue
-            recovered.append({"role": None, "text": text, "_track": track})
-
-        if not recovered:
-            out.append({**span, "recovered": None})
+        picked = _pick_streams(streams, window, roles, profiles, embed, separator, sample_rate)
+        if picked is None:
+            marked.append({**span, "separated": False})
             continue
 
-        assign_roles(recovered, profiles, embed)
-        out.append(
-            {**span, "recovered": [{"role": item["role"], "text": item["text"]} for item in recovered]}
-        )
-    return out
+        for role, patch in picked.items():
+            _splice(tracks[role], patch, start * per_ms, per_ms)
+        marked.append({**span, "separated": True})
+        used += 1
+
+    if not used:
+        return None
+    return tracks, marked
 
 
-def assign_roles(
-    recovered: list[dict[str, Any]],
-    profiles: dict[str, Any] | None,
-    embed: Callable[[Any], Any] | None,
-) -> None:
-    """Name each stream from voice embeddings, or leave both unnamed.
+def _pick_streams(
+    streams: list[Any],
+    window: Any,
+    roles: list[str],
+    profiles: dict[str, Any],
+    embed: Callable[[Any], Any],
+    separator: VoiceSeparator,
+    sample_rate: int,
+) -> dict[str, Any] | None:
+    """Assign the two streams to the two roles, and match their level.
 
-    Scored as a PAIRING, not per stream: two streams can both score highest
-    against the same role, and assigning them independently would report one
-    person twice - while the separator already guarantees they are two people.
+    Scored as a PAIRING, not per stream: both streams can score highest against
+    the same role, and assigning them independently would name one person twice
+    - while the separator already guarantees they are two people.
     """
     import numpy as np
 
-    if not profiles or embed is None or len(recovered) < 2:
-        return
-    roles = [role for role in ("caller", "agent") if role in profiles]
-    if len(roles) < 2:
-        return
-    vectors = [embed(item["_track"]) for item in recovered[:2]]
+    usable = [resample(stream, separator.rate, sample_rate) for stream in streams]
+    usable = [track for track in usable if float(np.abs(track).max()) > SILENT_PEAK]
+    if len(usable) < 2:
+        return None
+    vectors = [embed(track / (float(np.abs(track).max()) or 1.0) * 0.9) for track in usable[:2]]
     scores = [[float(np.dot(vector, profiles[role])) for role in roles] for vector in vectors]
     straight = scores[0][0] + scores[1][1]
     crossed = scores[0][1] + scores[1][0]
     if abs(straight - crossed) < MIN_ASSIGN_MARGIN:
-        # One voice reading both parts, or a window too short to embed: the
-        # words are worth keeping, the labels are not. Empty beats wrong -
-        # a wrong label blames the wrong side.
-        return
+        return None
     order = (0, 1) if straight > crossed else (1, 0)
-    for item, index in zip(recovered[:2], order, strict=True):
-        item["role"] = roles[index]
+
+    # The separator returns whatever amplitude it likes. Pasted in unchanged,
+    # the overlap ends up louder or quieter than its surroundings, and the VAD
+    # downstream reads that step as a turn boundary. Match the window's RMS.
+    reference = float(np.sqrt(np.mean(np.square(window)))) or 1.0
+    picked: dict[str, Any] = {}
+    for role, index in zip(roles, order, strict=True):
+        track = usable[index]
+        level = float(np.sqrt(np.mean(np.square(track)))) or 1.0
+        picked[role] = np.clip(track * (reference / level), -1.0, 1.0)
+    return picked
+
+
+def _splice(target: Any, patch: Any, offset: int, per_ms: int) -> None:
+    """Paste ``patch`` into ``target`` at ``offset``, crossfading both edges."""
+    import numpy as np
+
+    length = min(len(patch), len(target) - offset)
+    if length <= 0:
+        return
+    fade = min(FADE_MS * per_ms, length // 2)
+    ramp = np.ones(length, dtype="float32")
+    if fade > 0:
+        ramp[:fade] = np.linspace(0.0, 1.0, fade, dtype="float32")
+        ramp[-fade:] = np.linspace(1.0, 0.0, fade, dtype="float32")
+    window = target[offset : offset + length]
+    target[offset : offset + length] = window * (1.0 - ramp) + patch[:length] * ramp
 
 
 __all__ = [
+    "FADE_MS",
     "MIN_ASSIGN_MARGIN",
     "MIN_SEPARATE_MS",
     "PAD_MS",
     "SeparatorUnavailable",
     "VoiceSeparator",
-    "assign_roles",
-    "recover_overlap_text",
+    "build_role_tracks",
     "resample",
 ]

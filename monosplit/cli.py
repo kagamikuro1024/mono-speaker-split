@@ -64,14 +64,11 @@ def _in_ket_qua(result: Result) -> None:
         for span in result.overlaps:
             ai = span["who_cut_in"]
             huong = f" — {VAI[ai]} cut in" if ai in VAI else ""
-            print(f"             {span['start_ms'] / 1000:.1f}s{huong}")
-            # Words separated out of the overlap. Printed under the timestamp
-            # and marked "recovered": the separator can leak one voice into the
-            # other stream, so this is a lead for a human to confirm, not a
-            # measurement to trust.
-            for line in span.get("recovered") or []:
-                who = VAI.get(line["role"], "unknown speaker")
-                print(f"               recovered [{who}]: {line['text']}")
+            # Mark where the words came off a separated stream rather than the
+            # mixture. The separator can leak one voice into the other stream,
+            # so this is where a human should listen before trusting the text.
+            tach = " · voices separated to re-read the words" if span.get("separated") else ""
+            print(f"             {span['start_ms'] / 1000:.1f}s{huong}{tach}")
     if result.same_voice:
         print("Note       : both sides sound like one voice")
     for canh_bao in result.warnings:

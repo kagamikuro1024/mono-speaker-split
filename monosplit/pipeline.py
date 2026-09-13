@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from monosplit import audio
-from monosplit.separate_voices import MIN_SEPARATE_MS, recover_overlap_text
+from monosplit.separate_voices import MIN_SEPARATE_MS, build_role_tracks
 from monosplit.speakers import (
     MIN_COSINE_MARGIN,
     MIN_ENROLL_MS,
@@ -101,8 +101,10 @@ class Result:
     #: Moments where both sides are SUSPECTED to have spoken at once, read from
     #: the segmentation model's powerset layer. Each item: `start_ms`,
     #: `duration_ms`, `who_cut_in`, `who_yielded` (role names, `None` when the
-    #: direction cannot be inferred), and `recovered` - the words separated out
-    #: of that overlap, or `None` when it was too short to separate.
+    #: direction cannot be inferred), and `separated` - whether the words of the
+    #: turns covering that stretch were re-read off a separated stream instead
+    #: of the mixture. `separated` marks where to listen before trusting the
+    #: text.
     #:
     #: INFERRED, not measured - see `speakers.overlap_spans`. Use the count and
     #: the timestamps; do not add `duration_ms` up into a total overlap time.
@@ -125,9 +127,10 @@ def separate(
     """Split one file into turns labelled caller / agent.
 
     ``voice_separator`` is optional: pass a ``separate_voices.VoiceSeparator``
-    and every overlap at least ``MIN_SEPARATE_MS`` long also comes back with
-    the words recovered from it. It needs ``transcriber`` too - there is no
-    point separating audio nobody is going to read.
+    and every turn covering an overlap of at least ``MIN_SEPARATE_MS`` is
+    re-read off that role's recovery channel, so its text holds only the words
+    of the person who spoke it. It needs ``transcriber`` too - there is no point
+    separating audio nobody is going to read.
     """
     requirements = requirements or []
     info = audio.probe(source)
@@ -205,16 +208,16 @@ def separate(
             for span in spans
         ]
         if voice_separator is not None and transcriber is not None:
-            # The mixture swallowed whoever was quieter. Separate a window
-            # around each overlap and read the streams back - words only: the
-            # timestamps still come from the original waveform, never from a
-            # separated stream (its clock starts at the padded window edge).
-            overlaps = recover_overlap_text(
-                overlaps,
-                samples,
-                separator=voice_separator,
-                transcribe=lambda track: _transcribe_track(transcriber, track, work),
-                embed=splitter.embed,
+            # The mixture swallowed whoever was quieter, so every turn that
+            # overlaps is missing words or carrying the other person's. Rebuild
+            # one channel per role and re-read those turns off the channel of
+            # the person who spoke them - the same thing the two-channel path
+            # does, so the words land straight in the transcript.
+            #
+            # Timestamps still come from the original waveform: a separated
+            # stream's clock starts at the padded window edge.
+            turns, overlaps = _recover_overlapping_turns(
+                turns, overlaps, samples, splitter, transcriber, voice_separator, work
             )
         if transcriber is not None:
             turns = [turn for turn in turns if turn.text] or turns
@@ -313,7 +316,7 @@ def _label(
 
 
 def _role_profiles(
-    splitter: MonoSpeakerSplitter, samples, labels: list[Labelled]
+    splitter: MonoSpeakerSplitter, samples, turns: list[Turn]
 ) -> dict[str, object] | None:
     """One voice embedding per ROLE, taken from that role's longest turn.
 
@@ -323,34 +326,103 @@ def _role_profiles(
     """
     profiles: dict[str, object] = {}
     for role in ("caller", "agent"):
-        mine = [label for label in labels if label.speaker == role]
+        mine = [turn for turn in turns if turn.speaker == role]
         if not mine:
             return None
-        longest = max(mine, key=lambda label: label.end_ms - label.start_ms)
-        if longest.end_ms - longest.start_ms < MIN_SAMPLE_MS:
+        longest = max(mine, key=lambda turn: turn.duration_ms)
+        if longest.duration_ms < MIN_SAMPLE_MS:
             return None
         profiles[role] = splitter.embed(samples[longest.start_ms * 16 : longest.end_ms * 16])
     return profiles
 
 
-def _transcribe_track(transcriber: Transcriber, track, work: Path) -> str:
-    """Read words off a separated stream - words only, never timestamps.
+def _recover_overlapping_turns(
+    turns: list[Turn],
+    overlaps: list[dict],
+    samples,
+    splitter: MonoSpeakerSplitter,
+    transcriber: Transcriber,
+    voice_separator,
+    work: Path,
+) -> tuple[list[Turn], list[dict]]:
+    """Re-read every turn that overlaps, off that role's recovery channel.
 
-    A separated stream's clock starts at the padded window edge, so its
-    timestamps do not belong on the call's timeline.
+    Turns clear of any overlap keep their text: there the mixture holds one
+    voice only, so it is already the cleanest signal, and sending it through a
+    second model would only add a chance to be wrong.
 
-    VAD is off here: the clip is short and already known to contain speech,
-    while VAD on a short clip tends to clip the first word.
+    The turn of whoever CUT IN also gets its start pulled back to the start of
+    the overlap. Blind clustering cannot cut inside a stretch where both people
+    speak, so it starts the interrupter's turn AFTER the overlap and their first
+    words get counted into the other person's turn. A two-channel recording of
+    the same call shows the interrupter's turn starting inside the overlap, with
+    the two turns genuinely overlapping in time - which is what talking over
+    each other is.
     """
     import numpy as np
 
-    clip = work / "overlap_clip.wav"
-    with wave.open(str(clip), "wb") as dest:
-        dest.setnchannels(1)
-        dest.setsampwidth(2)
-        dest.setframerate(audio.TARGET_SAMPLE_RATE)
-        dest.writeframes((np.clip(track, -1.0, 1.0) * 32767).astype("int16").tobytes())
-    return " ".join(word.text for word in transcriber.words(clip, vad_filter=False)).strip()
+    profiles = _role_profiles(splitter, samples, turns)
+    if profiles is None:
+        return turns, [{**span, "separated": False} for span in overlaps]
+
+    built = build_role_tracks(
+        overlaps, samples, separator=voice_separator, profiles=profiles, embed=splitter.embed
+    )
+    if built is None:
+        return turns, [{**span, "separated": False} for span in overlaps]
+    tracks, marked = built
+    touched = [span for span in marked if span.get("separated")]
+
+    moved = list(turns)
+    for span in touched:
+        role = span.get("who_cut_in")
+        if role is None:
+            continue
+        end = span["start_ms"] + span["duration_ms"]
+        for index, turn in enumerate(moved):
+            if turn.speaker != role or turn.start_ms <= span["start_ms"]:
+                continue
+            if turn.start_ms > end + TURN_MERGE_GAP_MS:
+                break
+            moved[index] = Turn(
+                turn.speaker, span["start_ms"], turn.end_ms, turn.text, turn.margin
+            )
+            break
+
+    for role, track in tracks.items():
+        clip = work / f"recovered_{role}.wav"
+        with wave.open(str(clip), "wb") as dest:
+            dest.setnchannels(1)
+            dest.setsampwidth(2)
+            dest.setframerate(audio.TARGET_SAMPLE_RATE)
+            dest.writeframes((np.clip(track, -1.0, 1.0) * 32767).astype("int16").tobytes())
+        words = transcriber.words(clip)
+        for index, turn in enumerate(moved):
+            if turn.speaker != role:
+                continue
+            if not any(
+                turn.start_ms < span["start_ms"] + span["duration_ms"]
+                and span["start_ms"] < turn.end_ms
+                for span in touched
+            ):
+                continue
+            # The two recovery channels are independent, so words need no
+            # exclusive assignment the way they do on the mixture: a turn reads
+            # its words off its own role's channel. That is what lets two turns
+            # legitimately overlap in time.
+            spoken = " ".join(
+                word.text
+                for word in words
+                if word.start_ms < turn.end_ms and turn.start_ms <= word.end_ms
+            ).strip()
+            # A turn inside an overlap: the recovery channel wins even when it
+            # yields less text - the mixture there tends to glue both sides'
+            # words into one sentence.
+            if spoken:
+                moved[index] = Turn(
+                    turn.speaker, turn.start_ms, turn.end_ms, spoken, turn.margin
+                )
+    return moved, marked
 
 
 __all__ = [

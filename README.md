@@ -97,13 +97,13 @@ for turn in result.turns:
     print(f"{turn.start_ms:>7} {turn.speaker:<6} {turn.text}")
 
 for span in result.overlaps:          # suspected both talking at once — inferred
-    print(f"{span['start_ms']:>7} {span['who_cut_in']} cut in")
-    for line in span["recovered"] or []:   # words separated out of the overlap
-        print(f"          recovered [{line['role'] or 'unknown'}]: {line['text']}")
+    mark = " · separated" if span["separated"] else ""
+    print(f"{span['start_ms']:>7} {span['who_cut_in']} cut in{mark}")
 ```
 
 `separate` also takes `transcriber=Transcriber("small")` for text, `requirements=[...]` like
-`--requirement`, and `voice_separator=VoiceSeparator("sepformer16k.onnx")` to fill in `recovered`.
+`--requirement`, and `voice_separator=VoiceSeparator("sepformer16k.onnx")` so that turns covering an
+overlap are re-read off that role's recovery channel.
 When it cannot split, it raises `SeparationError` with a `code` of
 `khong_co_tieng_noi`, `khong_tach_nguoi_noi` or `hai_kenh_that` — a code so the caller can show the
 right message, instead of an empty result that looks like a completed run.
@@ -223,35 +223,41 @@ turn (ASR timestamps drifted, or it falls into silence) only then goes to the ne
 if it is within 400 ms — further than that it is dropped, because a careless assignment is worse than
 a missing word.
 
-On its own this does **not** reconstruct the text that was lost. A phrase inside the overlapping
-stretch is cut in two, the first half going to one person and the second half to the other:
-
-```
-caller      0-5262   … remember to read the number back before you dial. Number 09
-agent    5262-8160   -03456789, this is Lua Nga speaking.
-```
-
-Those turns stay exactly as they are. The words can, however, be recovered separately - see the next
-section.
+Without a separator that is where it ends: a phrase inside the overlapping stretch is cut in two,
+the first half going to one person and the second half to the other. With `--separator` the turns
+covering that stretch are re-read and come out whole - see the next section.
 
 ## Recovering the words inside an overlap
 
-Pass `--separator model.onnx` and every overlap of at least **400 ms** is separated into two streams
-and transcribed one stream at a time, so the words of the swallowed side come back:
+Pass `--separator model.onnx` and every overlap of at least **400 ms** is separated into two
+streams. Those streams are not reported on the side: they are spliced back into a **recovery channel
+per role** - the mixture outside the overlap, that role's separated stream inside - and each turn is
+re-read off the channel of the person who spoke it. The words land straight in the transcript, where
+the user can correct them.
+
+Same file, before and after, against a two-channel recording of the same call as ground truth:
 
 ```
-Suspected overlap: 2 time(s) (inferred, not measured)
-             1.0s — Caller cut in
-               recovered [agent]:  Vâng, đã hạ điều hòa xuống 18 độ.
-               recovered [caller]: Hạ điều hòa xuống 18 độ giúp tôi.
+#  Role    Start     End       Text
+1  Caller  0:00.000  0:05.262  Gọi cho tôi số 0903456789. Nhớ nhắc lại số trước khi bấm gọi nhé.
+2  Agent   0:05.245  0:08.160  -03 -456789, tôi gọi Lu Nga.          ← mixture: first words lost
+2  Agent   0:04.452  0:08.160  Số 0903456789, tôi gọi luôn ạ.        ← recovery channel
+
+Suspected overlap: 1 time(s) (inferred, not measured)
+             4.5s — Agent cut in · voices separated to re-read the words
 ```
 
-(Real output on Vietnamese call audio - kept verbatim rather than translated, since translating a
-measurement invents one. The agent line reads "Yes, the air conditioning is down to 18 degrees";
-the caller line, "Turn the air conditioning down to 18 degrees for me".)
+(Real output on Vietnamese call audio, kept verbatim - translating a measurement invents one. The
+agent turn reads "Number 0903456789, calling now".)
 
-Both lines match the ground truth of that file, while the mixture alone had produced
-`độ hứt tuổi.` - phonetic debris, not words - for the agent.
+Note the start time as well: **5.245 s → 4.452 s**, against 4.480 s in the two-channel recording.
+Blind clustering cannot cut inside a stretch where both people speak, so it starts the interrupter's
+turn *after* the overlap and their first words get counted into the other person's turn. When an
+overlap is separated, that turn's start is pulled back to the start of the overlap, and the two
+turns are then allowed to overlap in time - which is what talking over each other is.
+
+Every separated stretch is flagged (`separated: true`, and the CLI line above), because this is
+still inferred text: the place to listen before trusting it.
 
 ### What it costs, and which model
 
@@ -283,20 +289,22 @@ an ONNX export of `speechbrain/sepformer-whamr16k`, Apache-2.0. Still no PyTorch
 - **Short overlaps are left alone.** LibriCSS ([arXiv:2001.11482](https://arxiv.org/abs/2001.11482))
   measured 0% overlap and found separation made WER *worse*: 11.8 → 12.7. The suite here agrees: at
   200 ms, 2 of 6 cases came out worse than not separating. Hence the 400 ms floor.
-- **The output is recovered text, never measured text.** Cascaded separation → ASR fails through
-  *speaker leakage*: one person's words land in the other stream
+- **The text is still inferred, and says so.** Cascaded separation → ASR fails through *speaker
+  leakage*: one person's words land in the other stream
   ([arXiv:2608.22196](https://arxiv.org/abs/2608.22196), Interspeech 2026, up to 71–77% WER on AMI),
   and Whisper can invent whole sentences on short clips
-  ([arXiv:2402.08021](https://arxiv.org/abs/2402.08021)). So it is returned beside the turns, flagged,
-  for a human to confirm by ear - it never merges into the transcript.
-- **A role is assigned only when the embeddings are certain.** The two streams leave the separator
-  unnamed. Enrollment samples of each role decide which is which, scored as a pairing; below a 0.10
-  cosine margin `role` stays `null`. One TTS voice reading both parts lands here by design - an empty
-  label beats a wrong one, because a wrong one blames the wrong side.
+  ([arXiv:2402.08021](https://arxiv.org/abs/2402.08021)). The words do go into the transcript -
+  that is the point of a transcript a user can edit - but every rebuilt stretch carries
+  `separated: true` so the reader knows exactly where to listen first.
+- **No channels at all rather than guessed roles.** The two streams leave the separator unnamed.
+  Enrollment samples of each role decide which is which, scored as a pairing; below a 0.10 cosine
+  margin nothing is built and the mixture is kept. One TTS voice reading both parts lands here by
+  design: swapping the channels would swap both sides' words across the whole overlap, which is far
+  worse than a mixture that merely loses some.
 
-Recovering the **full** text of both sides, timestamps included, still requires two audio streams.
-That part is physics. What the separator buys back is the words - as a lead to verify, not as a
-measurement.
+What the separator does not buy back is **timestamps inside the overlap**: turn boundaries still
+come from the original waveform, and the interrupter's start is pulled to the overlap's own start,
+which the segmentation model also only inferred (±62 ms).
 
 ## Thresholds that matter
 
