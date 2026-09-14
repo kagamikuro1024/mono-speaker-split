@@ -58,6 +58,53 @@ TURN_MERGE_GAP_MS = 400
 # while separating the whole recording kept every sentence on the right side.
 DENSE_OVERLAP_SHARE = 0.30
 
+# Listening again to a stretch the full read returned no words for. See
+# ``Transcriber.listen_again``: short backchannels are folded into silence by
+# the voice-activity filter, and a turn with no text is dropped further down -
+# so the agent reads as silent for the whole of the caller's turn, and every
+# turn-taking measure loses its evidence.
+RESCUE_MAX_NO_SPEECH = 0.5
+# Words per second of clip, the ceiling that stops Whisper inventing: read a
+# short stretch out of context and it happily returns a sentence memorised from
+# its training data (a 270 ms tail came back as a full "subscribe to the
+# channel" line). Nobody speaks faster than six words a second.
+RESCUE_MAX_WORDS_PER_SECOND = 6
+
+
+def _rescue_silent_turns(
+    turns: list[Turn], pcm: bytes, transcriber: Transcriber, work: Path
+) -> list[Turn]:
+    """Re-read, on its own, every turn the full read left without text.
+
+    Only touches turns that are ALREADY empty: a turn that got text from the
+    full read keeps it, because that read had the context on both sides.
+    """
+    out: list[Turn] = []
+    for turn in turns:
+        if turn.text:
+            out.append(turn)
+            continue
+        clip_pcm = audio.slice_pcm(pcm, turn.start_ms, turn.end_ms)
+        if not clip_pcm:
+            out.append(turn)
+            continue
+        clip = work / f"again_{turn.start_ms}_{turn.end_ms}.wav"
+        with wave.open(str(clip), "wb") as dest:
+            dest.setnchannels(1)
+            dest.setsampwidth(2)
+            dest.setframerate(audio.TARGET_SAMPLE_RATE)
+            dest.writeframes(clip_pcm)
+        text, silence = transcriber.listen_again(clip)
+        seconds = (turn.end_ms - turn.start_ms) / 1000
+        too_long = len(text.split()) > max(1, round(seconds * RESCUE_MAX_WORDS_PER_SECOND))
+        if not text or silence >= RESCUE_MAX_NO_SPEECH or too_long:
+            out.append(turn)
+            continue
+        out.append(
+            Turn(turn.speaker, turn.start_ms, turn.end_ms, text, turn.margin)
+        )
+    return out
+
 
 def _overlap_share(overlaps: list[dict], runs: list[dict[str, int]]) -> float:
     """How much of the speech time is overlapped."""
@@ -292,6 +339,12 @@ def separate(
                 turns, overlaps, samples, splitter, transcriber, voice_separator, work
             )
         if transcriber is not None:
+            # Listen again to whatever is still text-less BEFORE dropping it:
+            # the full read folds short backchannels into silence (see
+            # ``_rescue_silent_turns``), and a dropped turn is a turn the agent
+            # never appears to have taken.
+            if any(not turn.text for turn in turns):
+                turns = _rescue_silent_turns(turns, pcm, transcriber, work)
             turns = [turn for turn in turns if turn.text] or turns
 
         return Result(

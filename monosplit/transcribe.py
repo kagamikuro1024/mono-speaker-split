@@ -68,6 +68,30 @@ class Transcriber:
                     )
         return out
 
+    def listen_again(self, path: Path, language: str = "vi") -> tuple[str, float]:
+        """Read ONE short clip on its own. Returns the text and how sure
+        Whisper is that the clip is silence.
+
+        Reading the WHOLE recording drops short backchannels — "ừm", "à",
+        "dạ": the voice-activity filter folds them into the surrounding
+        silence. Measured on a 192 second call (14/09/2026): two agent "Ờm"
+        at 106.9 s and 108.9 s produced no word at all from the full read, and
+        both came back the moment that stretch was cut out and read alone.
+
+        No word timestamps here on purpose: the caller already knows the
+        stretch, it only needs the words.
+        """
+        segments, _info = self._model.transcribe(str(path), language=language, vad_filter=True)
+        heard: list[str] = []
+        silence = 1.0
+        for segment in segments:
+            text = segment.text.strip()
+            if not text:
+                continue
+            heard.append(text)
+            silence = min(silence, float(getattr(segment, "no_speech_prob", 0.0)))
+        return " ".join(heard).strip(), silence
+
 
 def words_per_piece(
     words: list[Word], pieces: list[tuple[int, int, int]], pad_ms: int = 400

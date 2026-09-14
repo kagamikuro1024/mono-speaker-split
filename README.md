@@ -306,6 +306,27 @@ What the separator does not buy back is **timestamps inside the overlap**: turn 
 come from the original waveform, and the interrupter's start is pulled to the overlap's own start,
 which the segmentation model also only inferred (±62 ms).
 
+## Backchannels the full read swallows
+
+Whisper reading the WHOLE recording drops short backchannels — "ừm", "à", "dạ". Its
+voice-activity filter folds them into the surrounding silence, no word comes back, and a turn with
+no text is dropped: the agent then reads as silent for the entire caller turn, and every
+turn-taking measure loses its evidence.
+
+So every turn still without text is cut out and read **on its own** before it is dropped. Measured
+on a 192 second single-channel call (2026-09-14): two agent "Ờm" at 106.9 s and 108.9 s produced no
+word from the full read and both came back from the re-read — 31 turns became 34 on the same file.
+A turn that already has text is never touched: the full read had context on both sides and beats a
+clip read in isolation.
+
+Two gates stop the re-read inventing words, because a short clip out of context is exactly where
+Whisper recites its training data ([arXiv:2402.08021](https://arxiv.org/abs/2402.08021)):
+
+- the clip is dropped when Whisper's own `no_speech_prob` reaches `RESCUE_MAX_NO_SPEECH`;
+- the text is dropped when it exceeds `RESCUE_MAX_WORDS_PER_SECOND` words per second of clip — a
+  270 ms tail came back as a full thirteen-word "subscribe to the channel" line.
+
+
 ## Thresholds that matter
 
 Every number here is measured, and wherever it was measured on the sample set, the measured range is
@@ -327,6 +348,8 @@ written down in the source.
 | `MIN_SEPARATE_MS` | `400` | `separate_voices.py` | Below this, separating makes the words worse than leaving them: LibriCSS saw WER 11.8 → 12.7 at 0% overlap, and 2 of 6 cases at 200 ms in the suite here came out worse |
 | `PAD_MS` | `1500` | `separate_voices.py` | Context on both sides of the overlap. Cut flush and the separator only ever hears the mixed part and folds both voices into one stream; 1.5 s scored best on the suite |
 | `MIN_ASSIGN_MARGIN` | `0.10` | `separate_voices.py` | Same value as `MIN_COSINE_MARGIN`: two places assigning roles with two different thresholds would report two different answers for one recording |
+| `RESCUE_MAX_NO_SPEECH` | `0.5` | `pipeline.py` | A turn left without text is read again on its own; above this Whisper itself calls the clip silence, so keep the turn empty |
+| `RESCUE_MAX_WORDS_PER_SECOND` | `6` | `pipeline.py` | Ceiling on the re-read: nobody speaks faster, so anything longer is Whisper reciting training data at a short clip |
 
 ## Benchmark
 
